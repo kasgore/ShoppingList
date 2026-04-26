@@ -8,21 +8,7 @@
       <h2>Recipes</h2>
       <p class="muted">{{ recipes|length }} shown · pick from these on the home page.</p>
     </div>
-    <a href="{{ url_for('recipe_new') }}" class="button primary">+ New recipe</a>
   </header>
-
-  <form action="{{ url_for('recipe_import') }}" method="post" class="row import-row">
-    <label class="grow">
-      <span>Import from a recipe URL</span>
-      <input type="url" name="url" required
-             placeholder="https://www.allrecipes.com/recipe/...">
-    </label>
-    <button type="submit" class="button primary">Import</button>
-  </form>
-  <p class="muted small-note">
-    Pulls name, image, prep/cook time, ingredients, and instructions where the
-    site provides them. Review categories on the edit screen before using.
-  </p>
 
   <form action="{{ url_for('recipes_page') }}" method="get" class="row filter-row" id="filter-form">
     <label class="grow">

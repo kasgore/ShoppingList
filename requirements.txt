@@ -1,2 +1,4 @@
 Flask>=3.0
 recipe-scrapers>=15.0
+pytesseract>=0.3.10
+pillow-heif>=0.16

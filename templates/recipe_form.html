@@ -2,8 +2,45 @@
 {% block title %}{{ 'Edit' if recipe else 'New' }} recipe · Kasa{% endblock %}
 
 {% block content %}
+{% if not recipe %}
 <section class="card">
-  <h2>{{ 'Edit' if recipe else 'New' }} recipe</h2>
+  <h2>Quick add</h2>
+  <p class="muted">Save typing — pull a recipe from a URL or snap a photo of a
+    card and we'll pre-fill the form below.</p>
+
+  <form action="{{ url_for('recipe_import') }}" method="post" class="row import-row">
+    <label class="grow">
+      <span>Import from a recipe URL</span>
+      <input type="url" name="url" required
+             placeholder="https://www.allrecipes.com/recipe/...">
+    </label>
+    <button type="submit" class="button primary">Import</button>
+  </form>
+  <p class="muted small-note">
+    Pulls name, image, prep/cook time, ingredients, and instructions where the
+    site provides them. Review categories on the edit screen before using.
+  </p>
+
+  <form action="{{ url_for('recipe_import_photo') }}" method="post"
+        enctype="multipart/form-data" class="row import-row"
+        onsubmit="var b=this.querySelector('button[type=submit]');
+                  if(b){b.disabled=true;b.textContent='Scanning… up to 30s';}">
+    <label class="grow">
+      <span>Or scan a photo of a recipe card</span>
+      <input type="file" name="photo" accept="image/*" capture="environment" required>
+    </label>
+    <button type="submit" class="button primary">Scan photo</button>
+  </form>
+  <p class="muted small-note">
+    Uses on-device OCR (Tesseract). Works best on printed cards in good light.
+    The result lands on the edit screen for review — the raw OCR output is
+    stashed in Notes so you can spot anything the parser missed.
+  </p>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>{{ 'Edit' if recipe else 'Build from scratch' }}</h2>
   <form method="post" enctype="multipart/form-data" class="stack" id="recipe-form"
         action="{% if recipe %}{{ url_for('recipe_edit', recipe_id=recipe.id) }}{% else %}{{ url_for('recipe_new') }}{% endif %}">
     <label>

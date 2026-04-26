@@ -7,6 +7,8 @@ RUN apt-get update \
         libjpeg62-turbo \
         zlib1g \
         ca-certificates \
+        tesseract-ocr \
+        tesseract-ocr-eng \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
