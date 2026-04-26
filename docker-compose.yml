@@ -12,10 +12,13 @@
 services:
   shoppinglist:
     container_name: shoppinglist
-    # Pre-built multi-arch image (amd64 + arm64) published by the
-    # `Build & publish container image` GitHub Action on every push to
-    # main. Portainer just pulls — no local build required.
-    image: ghcr.io/kasgore/shoppinglist:latest
+    # Build the image locally on the Docker host from the Dockerfile in
+    # this repo. Portainer Stacks → Repository clones the repo, runs
+    # `docker compose up`, which triggers the build. The explicit
+    # lowercase `image:` tag is required because Docker rejects derived
+    # tag names that contain capitals (the repo is "ShoppingList").
+    build: .
+    image: shoppinglist:latest
     restart: unless-stopped
     ports:
       - "5000:5000"
