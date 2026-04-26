@@ -3,16 +3,16 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>{% block title %}Family Shopping List{% endblock %}</title>
+  <title>{% block title %}Kasa{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 
   <!-- PWA: installable on iOS/Android home screen. -->
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#2f7d32">
-  <meta name="application-name" content="Shopping">
+  <meta name="application-name" content="Kasa">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Shopping">
+  <meta name="apple-mobile-web-app-title" content="Kasa">
   <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-180.png') }}">
   <link rel="icon" type="image/png" sizes="192x192"
         href="{{ url_for('static', filename='icons/icon-192.png') }}">
@@ -23,7 +23,7 @@
       <span></span><span></span><span></span>
     </button>
     <div class="brand">
-      <a href="{{ url_for('index') }}">Family Shopping List</a>
+      <a href="{{ url_for('index') }}">Kasa</a>
     </div>
     <span class="topbar-spacer"></span>
   </header>

@@ -1,6 +1,6 @@
 {
-  "name": "Family Shopping List",
-  "short_name": "Shopping",
+  "name": "Kasa",
+  "short_name": "Kasa",
   "description": "Pick recipes, build a shared shopping list, and cook from your phone.",
   "start_url": "/",
   "scope": "/",
