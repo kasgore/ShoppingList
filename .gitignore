@@ -5,5 +5,10 @@ __pycache__/
 venv/
 shoppinglist.db
 static/uploads/
+
+# But DO commit anything explicitly placed under seed_data/ — it's
+# the deploy-time snapshot that gets baked into the Docker image.
+!seed_data/
+!seed_data/**
 .flask_session/
 .DS_Store
