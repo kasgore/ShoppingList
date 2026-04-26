@@ -9,7 +9,7 @@
  *
  * Bump CACHE_VERSION when the shell changes so old caches are evicted.
  */
-const CACHE_VERSION = "v22";
+const CACHE_VERSION = "v23";
 const SHELL_CACHE = `shell-${CACHE_VERSION}`;
 const PAGE_CACHE  = `pages-${CACHE_VERSION}`;
 const IMAGE_CACHE = `images-${CACHE_VERSION}`;
@@ -99,9 +99,10 @@ self.addEventListener("fetch", (event) => {
 
   // Recipes listing and edit/new forms: network-first so a freshly saved
   // recipe shows up immediately. The cached copy is only used if the
-  // network is unavailable.
+  // network is unavailable. Also covers the meal-plan calendar.
   const isListingOrForm =
     url.pathname === "/recipes" ||
+    url.pathname === "/plan" ||
     url.pathname.endsWith("/edit") ||
     url.pathname.endsWith("/new");
   if (isListingOrForm) {

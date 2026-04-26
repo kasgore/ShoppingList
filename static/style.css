@@ -741,3 +741,84 @@ code {
   .topbar, footer, .actions, .recipe-card-actions, #cook-mode { display: none !important; }
   .card { box-shadow: none; border: none; }
 }
+
+/* Meal plan calendar */
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+@media (max-width: 800px) {
+  .plan-grid { grid-template-columns: 1fr; }
+}
+.plan-day {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+  min-height: 140px;
+}
+.plan-day.is-today {
+  border-color: var(--accent);
+  background: #f1faf1;
+}
+.plan-day-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+.plan-day-head strong { font-size: 0.95rem; }
+.plan-day-head .muted { font-size: 0.8rem; }
+.plan-entries {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-grow: 1;
+}
+.plan-entry {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  background: #fff;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  font-size: 0.85rem;
+}
+.plan-slot {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-right: 4px;
+}
+.plan-add summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 4px 0;
+  color: var(--muted);
+}
+.plan-add summary:hover { color: var(--accent); }
+.plan-add-form {
+  margin-top: 6px;
+  padding: 8px;
+  background: #fff;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+.plan-add-form label.small { font-size: 0.8rem; }
+.plan-week-actions {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}

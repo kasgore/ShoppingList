@@ -9,6 +9,7 @@ import sqlite3
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from fractions import Fraction
 from typing import Iterable
 
@@ -478,6 +479,18 @@ CREATE TABLE IF NOT EXISTS checked_item (
     -- key format:  recipe::<name>::<unit>   or   adhoc::<id>
     key TEXT PRIMARY KEY
 );
+
+CREATE TABLE IF NOT EXISTS meal_plan (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_date  TEXT    NOT NULL,                       -- YYYY-MM-DD
+    slot       TEXT    NOT NULL DEFAULT '',            -- "Dinner", etc. (free-form)
+    recipe_id  INTEGER REFERENCES recipe(id) ON DELETE CASCADE,
+    text_plan  TEXT    NOT NULL DEFAULT '',            -- ad-hoc text when no recipe
+    multiplier REAL    NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_meal_plan_date ON meal_plan(plan_date);
 """
 
 
@@ -1268,6 +1281,22 @@ def _ocr_image_to_text(disk_path: str) -> str:
     return fallback if len(fallback.strip()) > len(primary.strip()) else primary
 
 
+def _week_start(d: date) -> date:
+    """Return the Sunday on or before `d`. Weeks run Sun → Sat."""
+    # weekday(): Mon=0…Sun=6. Days back to Sunday = (weekday + 1) % 7.
+    return d - timedelta(days=(d.weekday() + 1) % 7)
+
+
+def _parse_iso_date(s: str | None) -> date:
+    """Parse YYYY-MM-DD; fall back to today on bad input."""
+    if not s:
+        return date.today()
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return date.today()
+
+
 def _save_uploaded_image(file_storage) -> str | None:
     """Persist an uploaded image to static/uploads/ and return its public
     URL path. Returns None when no file was provided. Raises ValueError on
@@ -1824,6 +1853,135 @@ def create_app() -> Flask:
         return redirect(url_for("recipes_page"))
 
     # ---- Shopping list actions -----------------------------------------
+
+    @app.route("/plan")
+    def plan_page():
+        week_param = request.args.get("week", "")
+        today = date.today()
+        week_start = _week_start(_parse_iso_date(week_param) if week_param else today)
+        days = [week_start + timedelta(days=i) for i in range(7)]
+
+        db = get_db()
+        rows = db.execute(
+            "SELECT mp.id, mp.plan_date, mp.slot, mp.recipe_id, mp.text_plan, "
+            "       mp.multiplier, mp.sort_order, r.name AS recipe_name "
+            "FROM meal_plan mp "
+            "LEFT JOIN recipe r ON r.id = mp.recipe_id "
+            "WHERE mp.plan_date >= ? AND mp.plan_date <= ? "
+            "ORDER BY mp.plan_date, mp.sort_order, mp.id",
+            (days[0].isoformat(), days[6].isoformat()),
+        ).fetchall()
+
+        by_date = defaultdict(list)
+        for r in rows:
+            by_date[r["plan_date"]].append(r)
+
+        recipes = db.execute(
+            "SELECT id, name FROM recipe ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+
+        prev_week = week_start - timedelta(days=7)
+        next_week = week_start + timedelta(days=7)
+        week_end = week_start + timedelta(days=6)
+
+        return render_template(
+            "plan.html",
+            days=days,
+            by_date=by_date,
+            recipes=recipes,
+            today=today,
+            week_start=week_start,
+            week_end=week_end,
+            prev_week=prev_week.isoformat(),
+            next_week=next_week.isoformat(),
+            this_week_iso=_week_start(today).isoformat(),
+        )
+
+    @app.post("/plan/add")
+    def plan_add():
+        plan_date_raw = request.form.get("plan_date", "").strip()
+        slot = request.form.get("slot", "").strip()[:40]
+        recipe_id_raw = request.form.get("recipe_id", "").strip()
+        text_plan = request.form.get("text_plan", "").strip()[:200]
+        multiplier_raw = request.form.get("multiplier", "1").strip() or "1"
+
+        try:
+            datetime.strptime(plan_date_raw, "%Y-%m-%d")
+        except ValueError:
+            flash("Invalid date.", "error")
+            return redirect(url_for("plan_page"))
+
+        try:
+            multiplier = max(0.1, float(multiplier_raw))
+        except ValueError:
+            multiplier = 1.0
+
+        recipe_id = None
+        if recipe_id_raw:
+            try:
+                recipe_id = int(recipe_id_raw)
+            except ValueError:
+                recipe_id = None
+
+        if not recipe_id and not text_plan:
+            flash("Pick a recipe or type a quick plan.", "error")
+            return redirect(url_for("plan_page", week=plan_date_raw))
+
+        db = get_db()
+        db.execute(
+            "INSERT INTO meal_plan (plan_date, slot, recipe_id, text_plan, multiplier) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                plan_date_raw,
+                slot,
+                recipe_id,
+                text_plan if not recipe_id else "",
+                multiplier,
+            ),
+        )
+        db.commit()
+        return redirect(url_for("plan_page", week=plan_date_raw))
+
+    @app.post("/plan/<int:plan_id>/remove")
+    def plan_remove(plan_id: int):
+        db = get_db()
+        row = db.execute(
+            "SELECT plan_date FROM meal_plan WHERE id = ?", (plan_id,)
+        ).fetchone()
+        week = row["plan_date"] if row else ""
+        db.execute("DELETE FROM meal_plan WHERE id = ?", (plan_id,))
+        db.commit()
+        return redirect(url_for("plan_page", week=week))
+
+    @app.post("/plan/add-week-to-list")
+    def plan_add_week_to_list():
+        week_raw = request.form.get("week", "").strip()
+        week_start = _week_start(_parse_iso_date(week_raw))
+        week_end = week_start + timedelta(days=6)
+
+        db = get_db()
+        rows = db.execute(
+            "SELECT recipe_id, multiplier FROM meal_plan "
+            "WHERE plan_date BETWEEN ? AND ? AND recipe_id IS NOT NULL",
+            (week_start.isoformat(), week_end.isoformat()),
+        ).fetchall()
+
+        if not rows:
+            flash("No recipes planned for this week.", "error")
+            return redirect(url_for("plan_page", week=week_start.isoformat()))
+
+        for r in rows:
+            db.execute(
+                "INSERT INTO list_recipe (recipe_id, multiplier, added_by) "
+                "VALUES (?, ?, ?)",
+                (r["recipe_id"], r["multiplier"], "Plan"),
+            )
+        db.commit()
+        flash(
+            f"Added {len(rows)} planned recipe(s) to the shopping list.",
+            "success",
+        )
+        return redirect(url_for("index", _anchor="list"))
 
     @app.route("/list/add-recipe", methods=["POST"])
     def list_add_recipe():

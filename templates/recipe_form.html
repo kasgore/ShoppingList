@@ -151,7 +151,7 @@
       <tbody id="ing-rows">
         {% for ing in ingredients %}
           <tr class="ing-row">
-            <td><input type="number" step="0.25" min="0" name="ing_qty[]" value="{{ ing.quantity }}"></td>
+            <td><input type="number" step="any" min="0" name="ing_qty[]" value="{{ ing.quantity }}"></td>
             <td><input type="text" name="ing_unit[]" value="{{ ing.unit }}" placeholder="cup"></td>
             <td>
               <input type="text" name="ing_name[]" value="{{ ing.name }}" placeholder="Flour">
@@ -164,7 +164,7 @@
         {% endfor %}
         {% if not ingredients %}
           <tr class="ing-row">
-            <td><input type="number" step="0.25" min="0" name="ing_qty[]" value="1"></td>
+            <td><input type="number" step="any" min="0" name="ing_qty[]" value="1"></td>
             <td><input type="text" name="ing_unit[]" placeholder="cup"></td>
             <td>
               <input type="text" name="ing_name[]" placeholder="Flour">
@@ -186,7 +186,7 @@
 
 <template id="ing-template">
   <tr class="ing-row">
-    <td><input type="number" step="0.25" min="0" name="ing_qty[]" value="1"></td>
+    <td><input type="number" step="any" min="0" name="ing_qty[]" value="1"></td>
     <td><input type="text" name="ing_unit[]" placeholder="cup"></td>
     <td>
       <input type="text" name="ing_name[]" placeholder="Flour">
