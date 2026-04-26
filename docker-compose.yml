@@ -40,7 +40,20 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    networks:
+      - shoppinglist-net
 
 volumes:
   shoppinglist-data:
   shoppinglist-uploads:
+
+networks:
+  # Explicit subnet so Portainer environments that auto-assign endpoint
+  # IPs to containers don't fail the bridge with "user specified IP
+  # address is supported only when connecting to networks with user
+  # configured subnets".
+  shoppinglist-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
