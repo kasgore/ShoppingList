@@ -32,10 +32,9 @@ services:
     sysctls:
       net.ipv4.ip_unprivileged_port_start: 0
     networks:
-      lan:
-        # Container's static IP on your home network. Reachable at
-        # http://192.168.5.7  from any device on the LAN. No host port
-        # mapping needed — the container is on the LAN as its own device.
+      InternalNetwork:
+        # Container's static IP on the home LAN. Reachable directly at
+        # http://192.168.5.7  from any other device on the network.
         ipv4_address: 192.168.5.7
 
 volumes:
@@ -43,24 +42,9 @@ volumes:
   shoppinglist-uploads:
 
 networks:
-  # macvlan gives the container its own MAC + IP on the home LAN, so
-  # 192.168.5.7 is reachable directly from phones/laptops. The Docker
-  # host *itself* cannot reach the container on that IP (a Docker quirk
-  # of macvlan), but every other device on the LAN can.
-  #
-  # IMPORTANT: edit `parent:` to the actual NIC name on your Docker
-  # host. To find it, SSH in and run `ip -br link show` — it's the line
-  # that's UP and has your LAN IP, ignoring `lo`, `docker0`, `br-*`.
-  # Common values:
-  #   eth0        Raspberry Pi, generic Linux
-  #   ens18       Proxmox VMs / older Debian
-  #   enp1s0      modern Ubuntu/Debian on bare metal
-  #   end0        newer Pi OS releases
-  lan:
-    driver: macvlan
-    driver_opts:
-      parent: eth0
-    ipam:
-      config:
-        - subnet: 192.168.5.0/24
-          gateway: 192.168.5.1
+  # Re-use the pre-existing macvlan network already configured on this
+  # Docker host (subnet 192.168.5.0/24, gateway 192.168.5.1, parent NIC
+  # set up out-of-band). `external: true` tells compose not to create
+  # or modify it — just attach to it.
+  InternalNetwork:
+    external: true
