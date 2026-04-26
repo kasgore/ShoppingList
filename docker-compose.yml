@@ -16,15 +16,7 @@ services:
     image: shoppinglist:latest
     restart: unless-stopped
     environment:
-      # Set this to a long random string in production. Used for Flask
-      # flash messages — not a security boundary, but should not be
-      # left as the default.
       SHOPPINGLIST_SECRET: "change-me-to-a-long-random-string"
-    # Publish port 80 on the Docker host. Reach the app at
-    # http://<docker-host-ip>  (no port suffix). If your Docker host's
-    # LAN IP is 192.168.5.7, the app is at http://192.168.5.7 directly.
-    ports:
-      - "80:80"
     volumes:
       - shoppinglist-data:/data
       - shoppinglist-uploads:/app/static/uploads
@@ -39,7 +31,36 @@ services:
     # Allow the non-root `app` user to bind to port 80 inside the container.
     sysctls:
       net.ipv4.ip_unprivileged_port_start: 0
+    networks:
+      lan:
+        # Container's static IP on your home network. Reachable at
+        # http://192.168.5.7  from any device on the LAN. No host port
+        # mapping needed — the container is on the LAN as its own device.
+        ipv4_address: 192.168.5.7
 
 volumes:
   shoppinglist-data:
   shoppinglist-uploads:
+
+networks:
+  # macvlan gives the container its own MAC + IP on the home LAN, so
+  # 192.168.5.7 is reachable directly from phones/laptops. The Docker
+  # host *itself* cannot reach the container on that IP (a Docker quirk
+  # of macvlan), but every other device on the LAN can.
+  #
+  # IMPORTANT: edit `parent:` to the actual NIC name on your Docker
+  # host. To find it, SSH in and run `ip -br link show` — it's the line
+  # that's UP and has your LAN IP, ignoring `lo`, `docker0`, `br-*`.
+  # Common values:
+  #   eth0        Raspberry Pi, generic Linux
+  #   ens18       Proxmox VMs / older Debian
+  #   enp1s0      modern Ubuntu/Debian on bare metal
+  #   end0        newer Pi OS releases
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
+    ipam:
+      config:
+        - subnet: 192.168.5.0/24
+          gateway: 192.168.5.1
