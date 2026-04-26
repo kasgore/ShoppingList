@@ -16,9 +16,6 @@ services:
     # `Build & publish container image` GitHub Action on every push to
     # main. Portainer just pulls — no local build required.
     image: ghcr.io/kasgore/shoppinglist:latest
-    # `build:` is kept as a fallback for `docker compose up` on a dev
-    # machine; Portainer will prefer the pulled image when one exists.
-    build: .
     restart: unless-stopped
     ports:
       - "5000:5000"
