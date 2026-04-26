@@ -13,8 +13,10 @@ services:
   shoppinglist:
     container_name: shoppinglist
     build: .
-    # If you'd rather use a pre-built image, replace `build: .` with:
-    #   image: ghcr.io/youruser/shoppinglist:latest
+    # Explicit lowercase tag for the locally-built image. Without this,
+    # Portainer/Docker tries to derive an image name from the repo URL,
+    # which fails when the repo is named with capital letters.
+    image: shoppinglist:latest
     restart: unless-stopped
     ports:
       - "5000:5000"
