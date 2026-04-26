@@ -20,6 +20,11 @@ services:
       # flash messages — not a security boundary, but should not be
       # left as the default.
       SHOPPINGLIST_SECRET: "change-me-to-a-long-random-string"
+    # Publish port 80 on the Docker host. Reach the app at
+    # http://<docker-host-ip>  (no port suffix). If your Docker host's
+    # LAN IP is 192.168.5.7, the app is at http://192.168.5.7 directly.
+    ports:
+      - "80:80"
     volumes:
       - shoppinglist-data:/data
       - shoppinglist-uploads:/app/static/uploads
@@ -34,27 +39,7 @@ services:
     # Allow the non-root `app` user to bind to port 80 inside the container.
     sysctls:
       net.ipv4.ip_unprivileged_port_start: 0
-    networks:
-      lan:
-        # Static LAN IP for the container. Reach the app at
-        # http://192.168.5.7  (no port suffix needed — port 80).
-        ipv4_address: 192.168.5.7
 
 volumes:
   shoppinglist-data:
   shoppinglist-uploads:
-
-networks:
-  # macvlan: gives the container its own MAC + IP on the home LAN, so
-  # 192.168.5.7 is reachable from phones/laptops directly (not through
-  # the Docker host). Edit `parent:` to match your host's NIC if eth0
-  # is wrong (`ip link` lists candidates), and adjust subnet/gateway
-  # to match your actual home network.
-  lan:
-    driver: macvlan
-    driver_opts:
-      parent: eth0
-    ipam:
-      config:
-        - subnet: 192.168.5.0/24
-          gateway: 192.168.5.1
