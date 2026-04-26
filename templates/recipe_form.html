@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit' if recipe else 'New' }} recipe · Family Shopping List{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h2>{{ 'Edit' if recipe else 'New' }} recipe</h2>
+  <form method="post" enctype="multipart/form-data" class="stack" id="recipe-form"
+        action="{% if recipe %}{{ url_for('recipe_edit', recipe_id=recipe.id) }}{% else %}{{ url_for('recipe_new') }}{% endif %}">
+    <label>
+      <span>Name</span>
+      <input type="text" name="name" required
+             value="{{ recipe.name if recipe else '' }}"
+             placeholder="e.g., Mom's Lasagna">
+    </label>
+    <label>
+      <span>Description</span>
+      <textarea name="description" rows="2" placeholder="Optional">{{ recipe.description if recipe else '' }}</textarea>
+    </label>
+    <div class="row">
+      <label class="small">
+        <span>Servings</span>
+        <input type="number" name="servings" min="1" value="{{ recipe.servings if recipe else 4 }}">
+      </label>
+      <label class="small">
+        <span>Prep (min)</span>
+        <input type="number" name="prep_time" min="0" value="{{ recipe.prep_time if recipe else 0 }}">
+      </label>
+      <label class="small">
+        <span>Cook (min)</span>
+        <input type="number" name="cook_time" min="0" value="{{ recipe.cook_time if recipe else 0 }}">
+      </label>
+      <label class="small">
+        <span>Total (min)</span>
+        <input type="number" name="total_time" min="0" value="{{ recipe.total_time if recipe else 0 }}">
+      </label>
+      <label class="small">
+        <span>Rating</span>
+        <div class="star-rate" data-rating="{{ recipe.rating if recipe else 0 }}">
+          <input type="hidden" name="rating" value="{{ recipe.rating if recipe else 0 }}">
+          {% for n in range(1, 6) %}
+            <button type="button" class="star-btn" data-value="{{ n }}"
+                    aria-label="Rate {{ n }} stars">
+              {% if recipe and recipe.rating >= n %}★{% else %}☆{% endif %}
+            </button>
+          {% endfor %}
+          <button type="button" class="star-clear" data-value="0"
+                  title="Clear rating">×</button>
+        </div>
+      </label>
+    </div>
+    <div class="row">
+      <label class="grow">
+        <span>Category</span>
+        <select name="category">
+          <option value="" {% if not recipe or not recipe.category %}selected{% endif %}>—</option>
+          {% for c in recipe_categories %}
+            <option value="{{ c }}"
+                    {% if recipe and recipe.category == c %}selected{% endif %}>
+              {{ c }}
+            </option>
+          {% endfor %}
+          {# If the recipe was previously saved with a custom category, keep it. #}
+          {% if recipe and recipe.category and recipe.category not in recipe_categories %}
+            <option value="{{ recipe.category }}" selected>{{ recipe.category }}</option>
+          {% endif %}
+        </select>
+      </label>
+      <label class="grow">
+        <span>Image URL</span>
+        <input type="url" name="image_url"
+               value="{{ recipe.image_url if recipe and recipe.image_url else '' }}"
+               placeholder="https://...">
+      </label>
+    </div>
+    <div class="row photo-row">
+      {% if recipe and recipe.image_url %}
+        <img class="photo-preview" src="{{ recipe.image_url }}" alt="">
+      {% endif %}
+      <label class="grow">
+        <span>Take or upload a photo</span>
+        <input type="file" id="image_file" name="image_file"
+               accept="image/*" capture="environment">
+        <small class="muted">Replaces the URL above. Max 8 MB.</small>
+      </label>
+    </div>
+    <label>
+      <span>Source URL</span>
+      <input type="url" name="source_url"
+             value="{{ recipe.source_url if recipe and recipe.source_url else '' }}"
+             placeholder="https://... (optional)">
+    </label>
+    <label>
+      <span>Instructions</span>
+      <textarea name="instructions" rows="8"
+                placeholder="One step per line. These show up on the recipe's cook page.">{{ recipe.instructions if recipe and recipe.instructions else '' }}</textarea>
+    </label>
+    <label>
+      <span>Notes (your personal tweaks, family preferences, etc.)</span>
+      <textarea name="notes" rows="4"
+                placeholder="Optional">{{ recipe.notes if recipe and recipe.notes else '' }}</textarea>
+    </label>
+
+    <h3>Ingredients</h3>
+    <p class="muted small-note">
+      Aisle (Produce, Pantry, etc.) is auto-detected from each ingredient name
+      so the shopping list groups correctly — you don't need to set it here.
+    </p>
+    <table class="ing-table">
+      <thead>
+        <tr>
+          <th>Qty</th><th>Unit</th><th>Item</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="ing-rows">
+        {% for ing in ingredients %}
+          <tr class="ing-row">
+            <td><input type="number" step="0.25" min="0" name="ing_qty[]" value="{{ ing.quantity }}"></td>
+            <td><input type="text" name="ing_unit[]" value="{{ ing.unit }}" placeholder="cup"></td>
+            <td>
+              <input type="text" name="ing_name[]" value="{{ ing.name }}" placeholder="Flour">
+              {# Preserve the per-ingredient note (e.g., "diced") through edits
+                 even though we don't show it as an editable column. #}
+              <input type="hidden" name="ing_note[]" value="{{ ing.note or '' }}">
+            </td>
+            <td><button type="button" class="link remove-row" title="Remove">×</button></td>
+          </tr>
+        {% endfor %}
+        {% if not ingredients %}
+          <tr class="ing-row">
+            <td><input type="number" step="0.25" min="0" name="ing_qty[]" value="1"></td>
+            <td><input type="text" name="ing_unit[]" placeholder="cup"></td>
+            <td>
+              <input type="text" name="ing_name[]" placeholder="Flour">
+              <input type="hidden" name="ing_note[]" value="">
+            </td>
+            <td><button type="button" class="link remove-row" title="Remove">×</button></td>
+          </tr>
+        {% endif %}
+      </tbody>
+    </table>
+    <button type="button" id="add-ing" class="button">+ Add ingredient</button>
+
+    <div class="row end">
+      <a href="{{ url_for('recipes_page') }}" class="button">Cancel</a>
+      <button type="submit" class="button primary">Save recipe</button>
+    </div>
+  </form>
+</section>
+
+<template id="ing-template">
+  <tr class="ing-row">
+    <td><input type="number" step="0.25" min="0" name="ing_qty[]" value="1"></td>
+    <td><input type="text" name="ing_unit[]" placeholder="cup"></td>
+    <td>
+      <input type="text" name="ing_name[]" placeholder="Flour">
+      <input type="hidden" name="ing_note[]" value="">
+    </td>
+    <td><button type="button" class="link remove-row" title="Remove">×</button></td>
+  </tr>
+</template>
+{% endblock %}

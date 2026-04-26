@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}{{ recipe.name }} · Family Shopping List{% endblock %}
+
+{% block content %}
+<article class="card recipe-view" data-recipe-id="{{ recipe.id }}">
+  <header class="recipe-view-header">
+    <div class="rv-title">
+      <h1>{{ recipe.name }}</h1>
+      <p class="muted">
+        Serves {{ recipe.servings }}
+        {% if recipe.yields_text and recipe.yields_text|lower not in (recipe.servings|string + ' servings') %}
+          ({{ recipe.yields_text }})
+        {% endif %}
+        {% if recipe.category %}· {{ recipe.category }}{% endif %}
+        {% if recipe.cuisine %}· {{ recipe.cuisine }}{% endif %}
+        {% if recipe.total_time %}· {{ recipe.total_time }} min total{% endif %}
+        {% if recipe.author %}· by {{ recipe.author }}{% endif %}
+        {% if recipe.source_url %}
+          · <a href="{{ recipe.source_url }}" target="_blank" rel="noopener">source</a>
+        {% endif %}
+        {% if recipe.source_rating %}
+          · source rating {{ '%.1f' % recipe.source_rating }}/5
+        {% endif %}
+      </p>
+      {% if recipe.keywords %}
+        <p class="keywords">
+          {% for k in recipe.keywords.split(',') %}
+            {% if k.strip() %}<span class="kw">{{ k.strip() }}</span>{% endif %}
+          {% endfor %}
+        </p>
+      {% endif %}
+      <p class="rating-row">
+        <span class="star-rate big" data-rating="{{ recipe.rating }}"
+              data-recipe-id="{{ recipe.id }}">
+          {% for n in range(1, 6) %}
+            <button type="button" class="star-btn" data-value="{{ n }}"
+                    aria-label="Rate {{ n }} stars">
+              {% if recipe.rating >= n %}★{% else %}☆{% endif %}
+            </button>
+          {% endfor %}
+        </span>
+        <form action="{{ url_for('recipe_favorite', recipe_id=recipe.id) }}"
+              method="post" class="inline fav-form">
+          <button class="link star big" title="Favorite">
+            {% if recipe.is_favorite %}★{% else %}☆{% endif %}
+          </button>
+        </form>
+      </p>
+    </div>
+    <div class="actions">
+      <button onclick="window.print()" class="button" type="button">Print</button>
+      <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}" class="button">Edit</a>
+      <a href="{{ url_for('recipes_page') }}" class="button">All recipes</a>
+    </div>
+  </header>
+
+  {% if recipe.image_url %}
+    <img class="recipe-hero" src="{{ recipe.image_url }}" alt="">
+  {% else %}
+    <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}#image_file"
+       class="recipe-hero-link" title="Add a photo">
+      <img class="recipe-hero is-stock" src="{{ recipe_image(recipe) }}" alt="">
+    </a>
+  {% endif %}
+
+  {% if recipe.description %}
+    <p class="recipe-desc">{{ recipe.description }}</p>
+  {% endif %}
+
+  {% if recipe.prep_time or recipe.cook_time %}
+    <ul class="time-pills">
+      {% if recipe.prep_time %}<li>Prep <strong>{{ recipe.prep_time }} min</strong></li>{% endif %}
+      {% if recipe.cook_time %}<li>Cook <strong>{{ recipe.cook_time }} min</strong></li>{% endif %}
+      {% if recipe.total_time %}<li>Total <strong>{{ recipe.total_time }} min</strong></li>{% endif %}
+    </ul>
+  {% endif %}
+
+  <section class="cook-grid">
+    <div class="cook-ingredients">
+      <h2>Ingredients</h2>
+      <ul class="cook-ings">
+        {% for ing in ingredients %}
+          <li>
+            <label class="cook-check">
+              <input type="checkbox">
+              <span class="qty">{{ ing.quantity|fmtqty }} {{ ing.unit }}</span>
+              <span class="name">{{ ing.name }}</span>
+              {% if ing.note %}<span class="note">— {{ ing.note }}</span>{% endif %}
+            </label>
+          </li>
+        {% endfor %}
+      </ul>
+    </div>
+
+    <div class="cook-steps">
+      <h2>Instructions</h2>
+      {% if steps %}
+        <ol class="cook-step-list">
+          {% for step in steps %}
+            <li>
+              <label class="cook-check step">
+                <input type="checkbox">
+                <span>{{ step }}</span>
+              </label>
+            </li>
+          {% endfor %}
+        </ol>
+      {% else %}
+        <p class="muted">No instructions saved for this recipe yet.
+          <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}">Add some →</a>
+        </p>
+      {% endif %}
+
+      {% if recipe.notes %}
+        <h2 class="notes-h">Notes</h2>
+        <div class="recipe-notes">{{ recipe.notes }}</div>
+      {% endif %}
+
+      {% if recipe.nutrition %}
+        <h2 class="notes-h">Nutrition</h2>
+        <ul class="nutrition-list">
+          {% for line in recipe.nutrition.split('\n') %}
+            {% if line.strip() %}
+              <li>{{ line }}</li>
+            {% endif %}
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  </section>
+</article>
+{% endblock %}

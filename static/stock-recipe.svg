@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 450" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fef3c7"/>
+      <stop offset="1" stop-color="#fde68a"/>
+    </linearGradient>
+  </defs>
+  <rect width="600" height="450" fill="url(#bg)"/>
+  <!-- Plate -->
+  <circle cx="300" cy="240" r="150" fill="#ffffff" stroke="#d1d5db" stroke-width="6"/>
+  <circle cx="300" cy="240" r="118" fill="none" stroke="#e5e7eb" stroke-width="3"/>
+  <!-- Fork -->
+  <g stroke="#9ca3af" stroke-width="6" stroke-linecap="round" fill="none">
+    <line x1="120" y1="160" x2="120" y2="340"/>
+    <line x1="105" y1="160" x2="105" y2="220"/>
+    <line x1="135" y1="160" x2="135" y2="220"/>
+  </g>
+  <!-- Knife -->
+  <g stroke="#9ca3af" stroke-width="6" stroke-linecap="round" fill="none">
+    <line x1="480" y1="160" x2="480" y2="340"/>
+    <path d="M 480 160 L 495 220 L 480 250" stroke-width="10"/>
+  </g>
+  <!-- Camera badge to hint "needs a photo" -->
+  <g transform="translate(258 210)">
+    <rect width="84" height="60" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="3"/>
+    <circle cx="42" cy="32" r="18" fill="#ffffff" stroke="#9ca3af" stroke-width="3"/>
+    <circle cx="42" cy="32" r="8" fill="#9ca3af"/>
+    <rect x="30" y="-6" width="24" height="10" rx="2" fill="#f3f4f6" stroke="#9ca3af" stroke-width="3"/>
+  </g>
+  <text x="300" y="410" text-anchor="middle"
+        font-family="-apple-system, Segoe UI, Helvetica, sans-serif"
+        font-size="20" fill="#6b7280" font-weight="600">
+    Add a photo
+  </text>
+</svg>

@@ -1,0 +1,732 @@
+:root {
+  --bg: #f7f7f5;
+  --card: #ffffff;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --line: #e5e7eb;
+  --accent: #2f7d32;
+  --accent-ink: #ffffff;
+  --danger: #b91c1c;
+  --warn-bg: #fff7ed;
+  --good-bg: #ecfdf5;
+  --bad-bg: #fef2f2;
+  --radius: 10px;
+  --shadow: 0 1px 2px rgba(0,0,0,.06), 0 4px 12px rgba(0,0,0,.04);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.45;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.topbar {
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  /* Push content below the iPhone status bar / dynamic island when the
+     app is launched as a PWA from the home screen. The viewport meta
+     uses viewport-fit=cover so env(safe-area-inset-top) reports a
+     non-zero value in standalone mode. */
+  padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.topbar .brand { flex: 1; }
+.topbar .brand a {
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--ink);
+}
+.topbar-spacer { width: 36px; }   /* keep brand visually centered vs hamburger */
+
+.hamburger {
+  width: 36px; height: 36px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  border-radius: 8px;
+}
+.hamburger:hover { background: #f3f4f6; }
+.hamburger span {
+  width: 22px;
+  height: 2px;
+  background: var(--ink);
+  border-radius: 2px;
+  transition: transform .2s, opacity .2s;
+}
+.hamburger.open span:nth-child(1) { transform: translateY(7px) rotate(45deg); }
+.hamburger.open span:nth-child(2) { opacity: 0; }
+.hamburger.open span:nth-child(3) { transform: translateY(-7px) rotate(-45deg); }
+
+.menu-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.35);
+  z-index: 18;
+}
+.side-menu {
+  position: fixed;
+  top: 0; left: 0;
+  height: 100vh;
+  width: 260px;
+  max-width: 80vw;
+  background: var(--card);
+  border-right: 1px solid var(--line);
+  box-shadow: 2px 0 12px rgba(0,0,0,.1);
+  transform: translateX(-100%);
+  transition: transform .22s ease;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  padding: calc(16px + env(safe-area-inset-top, 0px)) 16px
+           calc(16px + env(safe-area-inset-bottom, 0px));
+  gap: 4px;
+}
+.side-menu.open { transform: translateX(0); }
+.side-menu-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 12px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+.side-menu a {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--ink);
+  font-weight: 500;
+}
+.side-menu a:hover { background: #f3f4f6; text-decoration: none; }
+#menu-close { font-size: 1.6rem; line-height: 1; }
+
+main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+
+.flashes { max-width: 1100px; margin: 12px auto 0; padding: 0 16px; }
+.flash { padding: 10px 14px; border-radius: var(--radius); margin-bottom: 8px; }
+.flash-success { background: var(--good-bg); }
+.flash-error { background: var(--bad-bg); color: var(--danger); }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  box-shadow: var(--shadow);
+  margin-bottom: 24px;
+}
+.card h2 { margin: 0 0 6px; }
+.card h3 { margin-top: 18px; }
+
+.grid {
+  display: grid;
+  gap: 24px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+
+.muted { color: var(--muted); font-size: .92rem; }
+.empty { color: var(--muted); font-style: italic; padding: 20px 0; }
+
+label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; }
+label > span { color: var(--muted); font-weight: 500; }
+input, select, textarea {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  width: 100%;
+}
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid #2f7d3233;
+  border-color: var(--accent);
+}
+
+.row { display: flex; gap: 12px; align-items: end; flex-wrap: wrap; }
+.row.end { justify-content: flex-end; }
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.grow { flex: 1 1 220px; min-width: 180px; }
+.small { flex: 0 0 130px; }
+
+button, .button {
+  font: inherit;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #fff;
+  cursor: pointer;
+  display: inline-block;
+  color: var(--ink);
+}
+button.primary, .button.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+button.danger, .button.danger {
+  background: #fff;
+  color: var(--danger);
+  border-color: #fca5a5;
+}
+button.link { background: none; border: none; color: var(--muted); font-size: 1.2rem; padding: 0 6px; }
+button.link:hover { color: var(--danger); }
+form.inline { display: inline; }
+
+.chip-list { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.chip-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background: #f3f4f6;
+  border-radius: 8px;
+}
+
+.list-card .list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.cat-section {
+  margin: 14px 0;
+  border-left: 4px solid var(--cat-color, var(--line));
+  padding-left: 10px;
+  border-radius: 4px;
+  background: var(--cat-bg, transparent);
+}
+.list-card h3.cat {
+  margin: 6px 0 4px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: var(--cat-color, var(--line));
+  color: #fff;
+  display: inline-block;
+  text-transform: uppercase;
+  font-size: .75rem;
+  letter-spacing: .05em;
+}
+.items { list-style: none; padding: 0; margin: 0; }
+.item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 4px;
+  border-bottom: 1px solid var(--line);
+}
+.item:last-child { border-bottom: none; }
+.item.checked .name,
+.item.checked .qty,
+.item.checked .note,
+.item.checked .sources {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+.item .check {
+  display: flex;
+  flex-direction: row;   /* override global label flex-direction: column */
+  justify-content: flex-start;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;       /* allow long ingredient names to wrap */
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+.item .check input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  margin: 0;
+  align-self: center;
+}
+.item .qty {
+  font-weight: 600;
+  min-width: 56px;
+  flex: 0 0 auto;
+  display: inline-block;
+}
+.item .name {
+  font-weight: 500;
+  flex: 1 1 auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.item .note {
+  color: var(--muted);
+  font-style: italic;
+  font-size: .9rem;
+  flex: 1 1 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.item .sources {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: .75rem;
+  font-style: italic;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+  text-align: right;
+  padding-left: 8px;
+}
+@media (max-width: 600px) {
+  /* On phones, hide sources to keep things tight on one line. */
+  .item .sources { display: none; }
+}
+
+/* Per-category colors. Each section sets --cat-color (used by the heading
+   chip + the left border) and --cat-bg (a soft tint of the same hue). */
+.cat-section[data-cat="Produce"]        { --cat-color: #16a34a; --cat-bg: #f0fdf4; }
+.cat-section[data-cat="Meat & Seafood"] { --cat-color: #b91c1c; --cat-bg: #fef2f2; }
+.cat-section[data-cat="Dairy & Eggs"]   { --cat-color: #2563eb; --cat-bg: #eff6ff; }
+.cat-section[data-cat="Bakery"]         { --cat-color: #b45309; --cat-bg: #fffbeb; }
+.cat-section[data-cat="Pantry"]         { --cat-color: #7c3aed; --cat-bg: #f5f3ff; }
+.cat-section[data-cat="Frozen"]         { --cat-color: #0891b2; --cat-bg: #ecfeff; }
+.cat-section[data-cat="Beverages"]      { --cat-color: #db2777; --cat-bg: #fdf2f8; }
+.cat-section[data-cat="Snacks"]         { --cat-color: #ea580c; --cat-bg: #fff7ed; }
+.cat-section[data-cat="Household"]      { --cat-color: #475569; --cat-bg: #f8fafc; }
+.cat-section[data-cat="Other"]          { --cat-color: #6b7280; --cat-bg: #f9fafb; }
+
+.recipe {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+  margin-top: 14px;
+}
+.recipe header {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+}
+.recipe .actions { display: flex; gap: 6px; }
+.ingredients { list-style: none; padding-left: 0; columns: 2; column-gap: 24px; }
+@media (max-width: 700px) { .ingredients { columns: 1; } }
+.ingredients li { padding: 3px 0; break-inside: avoid; }
+.ingredients .qty { display: inline-block; min-width: 70px; font-weight: 600; }
+.ingredients .cat { color: var(--muted); font-size: .8rem; margin-left: 8px; }
+.ingredients .note { color: var(--muted); font-style: italic; }
+
+.ing-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.ing-table th, .ing-table td { padding: 6px 4px; text-align: left; }
+.ing-table th { color: var(--muted); font-weight: 500; font-size: .8rem; }
+.ing-table input, .ing-table select { padding: 6px 8px; min-width: 0; }
+/* More distinct row separators on the edit form's ingredient table. */
+.ing-table tr.ing-row td { border-bottom: 2px solid #d1d5db; }
+.ing-table tr.ing-row:last-child td { border-bottom: none; }
+.ing-table tr.ing-row:nth-child(even) td { background: #fafafa; }
+/* Column widths: keep qty/unit/× narrow so the item name gets the rest. */
+.ing-table th:nth-child(1), .ing-table td:nth-child(1) { width: 70px; }
+.ing-table th:nth-child(2), .ing-table td:nth-child(2) { width: 80px; }
+.ing-table th:nth-child(4), .ing-table td:nth-child(4) { width: 28px; text-align: center; }
+
+@media (max-width: 600px) {
+  /* On phones, stack each row so the ingredient name gets a full-width line. */
+  .ing-table, .ing-table tbody, .ing-table tr, .ing-table td { display: block; width: 100%; }
+  .ing-table thead { display: none; }
+  .ing-table tr.ing-row {
+    display: grid;
+    grid-template-columns: 80px 90px 1fr;
+    gap: 6px;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 2px solid #d1d5db;
+  }
+  .ing-table tr.ing-row:last-child { border-bottom: none; }
+  .ing-table tr.ing-row:nth-child(even) { background: #fafafa; border-radius: 6px; }
+  .ing-table tr.ing-row td { padding: 0; border-bottom: none; background: transparent; }
+  /* Row layout:
+       [ qty ][ unit ][ remove × ]
+       [ item input full width   ]
+  */
+  .ing-table tr.ing-row td:nth-child(1) { grid-column: 1; }
+  .ing-table tr.ing-row td:nth-child(2) { grid-column: 2; }
+  .ing-table tr.ing-row td:nth-child(4) { grid-column: 3; justify-self: end; width: auto; }
+  .ing-table tr.ing-row td:nth-child(3) { grid-column: 1 / -1; }
+  .ing-table tr.ing-row td:nth-child(3) input { font-size: 1rem; }
+}
+
+footer {
+  text-align: center;
+  color: var(--muted);
+  padding: 20px 0 40px;
+}
+code {
+  background: #f3f4f6;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: .9em;
+}
+.import-row {
+  margin-top: 14px;
+  padding: 12px;
+  background: #f9fafb;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}
+.small-note { font-size: .8rem; margin-top: 4px; }
+
+/* Cook view (phone-friendly recipe page) */
+.recipe-view h1 { margin: 0 0 4px; font-size: 1.6rem; }
+.recipe-view-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.recipe-view-header .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.recipe-desc { color: var(--ink); }
+
+.cook-grid {
+  display: grid;
+  gap: 28px;
+  grid-template-columns: minmax(220px, 1fr) 2fr;
+  margin-top: 18px;
+}
+@media (max-width: 760px) {
+  .cook-grid { grid-template-columns: 1fr; gap: 18px; }
+}
+.cook-grid h2 {
+  margin: 0 0 10px;
+  font-size: 1.1rem;
+  border-bottom: 1px dashed var(--line);
+  padding-bottom: 4px;
+}
+.cook-ings { list-style: none; padding: 0; margin: 0; }
+.cook-ings li {
+  padding: 8px 8px 8px 10px;
+  border-bottom: 2px solid #d1d5db;
+}
+.cook-ings li:last-child { border-bottom: none; }
+.cook-ings li:nth-child(even) { background: #fafafa; }
+.cook-check {
+  display: flex;
+  flex-direction: row;        /* override global label flex-direction: column */
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.cook-check input {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  margin: 0;
+}
+.cook-ings .cook-check {
+  flex-wrap: wrap;            /* allow long ingredient names to wrap */
+  align-items: baseline;
+  min-width: 0;
+}
+.cook-ings .cook-check input { align-self: center; }
+.cook-ings .cook-check .name {
+  flex: 1 1 auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.cook-ings .cook-check .note {
+  flex: 1 1 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.cook-check.step { align-items: flex-start; white-space: normal; flex: 1; }
+.cook-check.step span {
+  white-space: normal;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cook-check input:checked ~ span { color: var(--muted); text-decoration: line-through; }
+/* Numbered instructions: drop the default <ol> marker (which overlapped
+   the flex-laid-out checkbox) and use a CSS counter rendered as its own
+   column to the left of the [checkbox + text] label. */
+.cook-step-list {
+  list-style: none;
+  padding-left: 0;
+  margin-top: 8px;
+  counter-reset: step;
+  line-height: 1.55;
+}
+.cook-step-list li {
+  padding: 10px 0;
+  font-size: 1.02rem;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border-bottom: 1px solid var(--line);
+}
+.cook-step-list li:last-child { border-bottom: none; }
+.cook-step-list li::before {
+  counter-increment: step;
+  content: counter(step) ".";
+  flex: 0 0 auto;
+  min-width: 24px;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.55;
+}
+.cook-ings .qty { font-weight: 600; min-width: 60px; }
+.cook-ings .note { color: var(--muted); font-style: italic; font-size: .9rem; }
+
+/* Recipe listing as cards with thumbnails. */
+.recipe-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  margin-top: 14px;
+}
+.recipe-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.recipe-card-link {
+  color: inherit;
+  text-decoration: none;
+  display: flex;
+  flex-direction: column;
+}
+.recipe-card-link:hover { text-decoration: none; }
+.recipe-thumb {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+  background: #f3f4f6;
+}
+.recipe-thumb.is-stock,
+.recipe-hero.is-stock {
+  object-fit: contain;
+  background: #fef3c7;
+  cursor: pointer;
+}
+.recipe-thumb-link, .recipe-hero-link { display: block; }
+.recipe-thumb-link:hover .is-stock,
+.recipe-hero-link:hover .is-stock { filter: brightness(.96); }
+.photo-row { align-items: center; }
+.photo-preview {
+  width: 120px;
+  height: 90px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.recipe-thumb.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2.5rem;
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: -.02em;
+}
+.recipe-card-body { padding: 10px 12px; }
+.recipe-card-body h3 { margin: 0 0 4px; font-size: 1.05rem; }
+.recipe-card-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+.recipe-card-actions .star { font-size: 1.4rem; padding: 0 4px; color: #f59e0b; }
+
+/* Clickable star rating widget. */
+.star-rate {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.star-rate .star-btn {
+  background: transparent;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  color: #f59e0b;
+  font-size: 1.4rem;
+  line-height: 1;
+  width: auto;
+}
+.star-rate.big .star-btn { font-size: 1.8rem; padding: 2px 6px; }
+.star-rate .star-btn:hover { transform: scale(1.1); }
+.star-rate .star-clear {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 1.1rem;
+  padding: 2px 4px;
+  cursor: pointer;
+  width: auto;
+}
+.star-rate .star-clear:hover { color: var(--danger); }
+.add-list-btn { padding: 6px 10px; font-weight: 600; }
+.add-list-btn:disabled { opacity: .8; }
+.stars { color: #f59e0b; margin: 0; letter-spacing: 2px; }
+.stars.big { font-size: 1.2rem; }
+.star.big { font-size: 1.6rem; color: #f59e0b; }
+.rating-row { display: flex; align-items: center; gap: 6px; margin: 4px 0 0; }
+
+.filter-row { margin-top: 16px; }
+.checkbox-inline { flex-direction: row; align-items: center; gap: 6px; }
+.checkbox-inline input { width: auto; }
+
+.recipe-hero {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: cover;
+  border-radius: var(--radius);
+  margin: 8px 0 12px;
+}
+.time-pills {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 12px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.time-pills li {
+  padding: 6px 10px;
+  background: #f3f4f6;
+  border-radius: 999px;
+  font-size: .9rem;
+}
+.notes-h { margin-top: 22px; }
+.recipe-notes {
+  background: var(--warn-bg);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  white-space: pre-wrap;
+}
+.keywords { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; }
+.keywords .kw {
+  font-size: .75rem;
+  background: #ecfdf5;
+  color: #166534;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+.nutrition-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 6px 12px;
+}
+.nutrition-list li {
+  font-size: .9rem;
+  padding: 6px 10px;
+  background: #f3f4f6;
+  border-radius: 6px;
+}
+
+/* Inline step timer button (within instruction text). */
+.step-timer {
+  background: #ecfdf5;
+  color: #166534;
+  border: 1px solid #a7f3d0;
+  border-radius: 999px;
+  padding: 1px 10px;
+  margin: 0 2px;
+  cursor: pointer;
+  font-size: .9em;
+  font-weight: 600;
+  white-space: nowrap;
+  width: auto;
+}
+.step-timer:hover { background: #d1fae5; }
+
+/* Floating panel of running timers. */
+#timer-panel {
+  position: fixed;
+  right: 12px;
+  /* Stay above the iPhone home indicator. */
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  z-index: 50;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px rgba(0,0,0,.18);
+  min-width: 220px;
+  max-width: 90vw;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* `display: flex` above beats the HTML hidden attribute's user-agent
+   `display: none`, which is why an empty panel was still rendering as a
+   tiny pill after the last timer was cancelled. Force-hide here. */
+#timer-panel[hidden] { display: none; }
+.timer-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f3f4f6;
+}
+.timer-row.finished {
+  background: #fef3c7;
+  animation: timer-pulse 1s ease-in-out infinite;
+}
+@keyframes timer-pulse {
+  0%, 100% { background: #fef3c7; }
+  50%      { background: #fde68a; }
+}
+.timer-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 1px;
+}
+.timer-recipe {
+  font-size: .85rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.timer-step {
+  font-size: .75rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.timer-remaining {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 1.05rem;
+  margin-top: 2px;
+}
+.timer-cancel { font-size: 1.4rem; line-height: 1; }
+@media print {
+  .topbar, footer, .actions, .recipe-card-actions, #cook-mode { display: none !important; }
+  .card { box-shadow: none; border: none; }
+}

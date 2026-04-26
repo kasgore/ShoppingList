@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Recipes · Family Shopping List{% endblock %}
+
+{% block content %}
+<section class="card">
+  <header class="list-header">
+    <div>
+      <h2>Recipes</h2>
+      <p class="muted">{{ recipes|length }} shown · pick from these on the home page.</p>
+    </div>
+    <a href="{{ url_for('recipe_new') }}" class="button primary">+ New recipe</a>
+  </header>
+
+  <form action="{{ url_for('recipe_import') }}" method="post" class="row import-row">
+    <label class="grow">
+      <span>Import from a recipe URL</span>
+      <input type="url" name="url" required
+             placeholder="https://www.allrecipes.com/recipe/...">
+    </label>
+    <button type="submit" class="button primary">Import</button>
+  </form>
+  <p class="muted small-note">
+    Pulls name, image, prep/cook time, ingredients, and instructions where the
+    site provides them. Review categories on the edit screen before using.
+  </p>
+
+  <form action="{{ url_for('recipes_page') }}" method="get" class="row filter-row" id="filter-form">
+    <label class="grow">
+      <span>Search</span>
+      <input type="search" name="q" value="{{ q }}" placeholder="Name, description, or notes">
+    </label>
+    <label class="small">
+      <span>Category</span>
+      <select name="cat" onchange="this.form.submit()">
+        <option value="">All</option>
+        {% for c in recipe_categories %}
+          <option value="{{ c }}" {% if c == cat %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+        {% for c in existing_categories %}
+          {% if c not in recipe_categories %}
+            <option value="{{ c }}" {% if c == cat %}selected{% endif %}>{{ c }}</option>
+          {% endif %}
+        {% endfor %}
+      </select>
+    </label>
+    <label class="checkbox-inline">
+      <input type="checkbox" name="favs" value="1" {% if favs %}checked{% endif %}
+             onchange="this.form.submit()">
+      <span>Favorites only</span>
+    </label>
+    <button type="submit" class="button">Apply</button>
+    {% if q or cat or favs %}
+      <a href="{{ url_for('recipes_page') }}" class="button">Clear</a>
+    {% endif %}
+  </form>
+
+  {% if not recipes %}
+    <p class="empty">
+      {% if q or cat or favs %}
+        No recipes match those filters.
+      {% else %}
+        No recipes yet. <a href="{{ url_for('recipe_new') }}">Add one</a>.
+      {% endif %}
+    </p>
+  {% endif %}
+
+  <div class="recipe-grid">
+  {% for r in recipes %}
+    <article class="recipe-card">
+      {% if r.recipe.image_url %}
+        <a href="{{ url_for('recipe_view', recipe_id=r.recipe.id) }}" class="recipe-thumb-link">
+          <img class="recipe-thumb" src="{{ r.recipe.image_url }}" alt="" loading="lazy">
+        </a>
+      {% else %}
+        <a href="{{ url_for('recipe_edit', recipe_id=r.recipe.id) }}#image_file"
+           class="recipe-thumb-link" title="Add a photo">
+          <img class="recipe-thumb is-stock" src="{{ recipe_image(r.recipe) }}" alt="" loading="lazy">
+        </a>
+      {% endif %}
+      <a href="{{ url_for('recipe_view', recipe_id=r.recipe.id) }}" class="recipe-card-link">
+        <div class="recipe-card-body">
+          <h3>{{ r.recipe.name }}</h3>
+          <p class="muted small-note">
+            Serves {{ r.recipe.servings }}
+            {% if r.recipe.total_time %}· {{ r.recipe.total_time }} min{% endif %}
+            {% if r.recipe.category %}· {{ r.recipe.category }}{% endif %}
+          </p>
+          {% if r.recipe.rating %}
+            <p class="stars">{% for _ in range(r.recipe.rating) %}★{% endfor %}{% for _ in range(5 - r.recipe.rating) %}☆{% endfor %}</p>
+          {% endif %}
+        </div>
+      </a>
+      <div class="recipe-card-actions">
+        <form action="{{ url_for('list_add_recipe') }}" method="post" class="inline add-list-form">
+          <input type="hidden" name="recipe_id" value="{{ r.recipe.id }}">
+          <input type="hidden" name="multiplier" value="1">
+          <button class="button primary add-list-btn" title="Add to shopping list">
+            + List
+          </button>
+        </form>
+        <form action="{{ url_for('recipe_favorite', recipe_id=r.recipe.id) }}"
+              method="post" class="inline fav-form">
+          <button class="link star" title="Toggle favorite">
+            {% if r.recipe.is_favorite %}★{% else %}☆{% endif %}
+          </button>
+        </form>
+        <a href="{{ url_for('recipe_edit', recipe_id=r.recipe.id) }}" class="button">Edit</a>
+        <form action="{{ url_for('recipe_delete', recipe_id=r.recipe.id) }}"
+              method="post"
+              onsubmit="return confirm('Delete {{ r.recipe.name }}?');" class="inline">
+          <button class="button danger">Delete</button>
+        </form>
+      </div>
+    </article>
+  {% endfor %}
+  </div>
+</section>
+{% endblock %}

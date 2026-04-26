@@ -1,0 +1,42 @@
+# Family Shopping List — docker compose stack.
+#
+# Deploy via Portainer Stacks:
+#   1. Stacks → Add stack → Name "shoppinglist"
+#   2. Build method: Repository (point at your git repo) OR Web editor
+#      with the contents of this file IF the image is built elsewhere.
+#   3. Deploy.
+#
+# After deploy, browse to http://<docker-host-ip>:5000 and add to your
+# iPhone home screen.
+
+services:
+  shoppinglist:
+    container_name: shoppinglist
+    build: .
+    # If you'd rather use a pre-built image, replace `build: .` with:
+    #   image: ghcr.io/youruser/shoppinglist:latest
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # Set this to a long random string in production. Used for Flask
+      # flash messages — not a security boundary, but should not be
+      # left as the default.
+      SHOPPINGLIST_SECRET: "change-me-to-a-long-random-string"
+    volumes:
+      # SQLite database lives here so it survives container rebuilds.
+      - shoppinglist-data:/data
+      # Photos uploaded from phones live here.
+      - shoppinglist-uploads:/app/static/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; \
+              sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/manifest.json',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  shoppinglist-data:
+  shoppinglist-uploads:

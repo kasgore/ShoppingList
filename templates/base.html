@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{% block title %}Family Shopping List{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+  <!-- PWA: installable on iOS/Android home screen. -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#2f7d32">
+  <meta name="application-name" content="Shopping">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Shopping">
+  <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/icon-180.png') }}">
+  <link rel="icon" type="image/png" sizes="192x192"
+        href="{{ url_for('static', filename='icons/icon-192.png') }}">
+</head>
+<body>
+  <header class="topbar">
+    <button id="menu-toggle" class="hamburger" aria-label="Open menu" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+    <div class="brand">
+      <a href="{{ url_for('index') }}">Family Shopping List</a>
+    </div>
+    <span class="topbar-spacer"></span>
+  </header>
+
+  <div id="menu-overlay" class="menu-overlay" hidden></div>
+  <nav id="side-menu" class="side-menu" aria-hidden="true">
+    <div class="side-menu-header">
+      <strong>Menu</strong>
+      <button id="menu-close" class="link" aria-label="Close menu">×</button>
+    </div>
+    <a href="{{ url_for('index') }}">Plan &amp; Shop</a>
+    <a href="{{ url_for('recipes_page') }}">Recipes</a>
+    <a href="{{ url_for('recipe_new') }}">New Recipe</a>
+  </nav>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+        {% for category, msg in messages %}
+          <div class="flash flash-{{ category }}">{{ msg }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer>
+    <small>Pick recipes, add anything else, shop happy.</small>
+  </footer>
+
+  <!-- Pre-loaded alarm sound. Played by the timer JS when a countdown
+       finishes; iOS will only play it after the user has tapped the page
+       at least once (a Safari restriction on autoplay). -->
+  <audio id="timer-alarm" preload="auto" playsinline
+         src="{{ url_for('static', filename='beep.wav') }}"></audio>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

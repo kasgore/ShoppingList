@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+shoppinglist.db
+static/uploads/*
+!static/uploads/.gitkeep
+README.md

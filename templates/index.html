@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}Plan & Shop · Family Shopping List{% endblock %}
+
+{% block content %}
+<div class="grid">
+
+  <section class="card">
+    <h2>Pick a recipe</h2>
+    <p class="muted">Add a known recipe to tonight's list. Use the multiplier
+      to scale (e.g., <code>2</code> for double batch).</p>
+    {% if recipes %}
+    <form action="{{ url_for('list_add_recipe') }}" method="post" class="row">
+      <label class="grow">
+        <span>Recipe</span>
+        <select name="recipe_id" required>
+          {% for r in recipes %}
+            <option value="{{ r.id }}">{{ r.name }} (serves {{ r.servings }})</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="small">
+        <span>Multiplier</span>
+        <input type="number" name="multiplier" step="1" min="1" value="1">
+      </label>
+      <button type="submit" class="primary">Add to list</button>
+    </form>
+    {% else %}
+      <p>No recipes yet. <a href="{{ url_for('recipe_new') }}">Add your first recipe →</a></p>
+    {% endif %}
+
+    {% if active_recipes %}
+    <h3>On the list</h3>
+    <ul class="chip-list">
+      {% for ar in active_recipes %}
+      <li>
+        <span>
+          <strong><a href="{{ url_for('recipe_view', recipe_id=ar.recipe_id) }}">{{ ar.name }}</a></strong>
+          {% if ar.multiplier != 1 %}<em class="muted">×{{ ar.multiplier|fmtqty }}</em>{% endif %}
+          {% if ar.added_by %}<em class="muted">— {{ ar.added_by }}</em>{% endif %}
+        </span>
+        <form action="{{ url_for('list_remove_recipe', list_recipe_id=ar.id) }}"
+              method="post" class="inline">
+          <button class="link" title="Remove">×</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Add an ad-hoc item</h2>
+    <p class="muted">Need a Diet Coke? Toilet paper? Add it here without a recipe.</p>
+    <form action="{{ url_for('list_add_adhoc') }}" method="post" class="stack">
+      <label>
+        <span>What do you need?</span>
+        <input type="text" name="name" required placeholder="e.g., Diet Coke">
+      </label>
+      <label class="small">
+        <span>Quantity</span>
+        <input type="number" name="quantity" step="1" min="1" value="1">
+      </label>
+      <label>
+        <span>Note</span>
+        <input type="text" name="note" placeholder="Brand preference, size, etc.">
+      </label>
+      <button type="submit" class="primary">Add to list</button>
+    </form>
+  </section>
+
+</div>
+
+<section id="list" class="card list-card">
+  <header class="list-header">
+    <div>
+      <h2>Shopping list</h2>
+      <p class="muted">
+        <span id="list-total">{{ total_items }}</span>
+        item{{ '' if total_items == 1 else 's' }} ·
+        <span id="list-checked">{{ checked_count }}</span> checked off
+      </p>
+    </div>
+    <div class="actions">
+      <form action="{{ url_for('list_clear') }}" method="post"
+            onsubmit="return confirm('Clear the entire shopping list?');">
+        <input type="hidden" name="scope" value="all">
+        <button class="danger">Clear list</button>
+      </form>
+    </div>
+  </header>
+
+  {% if total_items == 0 %}
+    <p class="empty">Nothing to shop for yet — pick a recipe or add an item.</p>
+  {% else %}
+    {% for category, items in grouped.items() %}
+      <div class="cat-section" data-cat="{{ category }}">
+      <h3 class="cat">{{ category }}</h3>
+      <ul class="items">
+        {% for item in items %}
+          <li class="item {% if item.checked %}checked{% endif %}" data-key="{{ item.key }}">
+            <label class="check">
+              <input type="checkbox" class="toggle" {% if item.checked %}checked{% endif %}>
+              <span class="qty">
+                {% if item.display_quantity %}{{ item.display_quantity }}{% endif %}
+                {% if item.unit %}{{ item.unit }}{% endif %}
+              </span>
+              <span class="name">{{ item.name }}</span>
+              {% if item.note %}<span class="note">— {{ item.note }}</span>{% endif %}
+              <span class="sources">{{ item.sources|join(', ') }}</span>
+            </label>
+            {% if item.is_adhoc %}
+              <form action="{{ url_for('list_remove_adhoc', adhoc_id=item.adhoc_id) }}"
+                    method="post" class="inline">
+                <button class="link" title="Remove">×</button>
+              </form>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+      </div>
+    {% endfor %}
+  {% endif %}
+</section>
+{% endblock %}
