@@ -30,12 +30,14 @@ USER app
 
 ENV SHOPPINGLIST_DB=/data/shoppinglist.db \
     HOST=0.0.0.0 \
-    PORT=5000 \
+    PORT=80 \
     PYTHONUNBUFFERED=1
 
-EXPOSE 5000
+EXPOSE 80
 
 # 2 workers is plenty for family LAN traffic; bump if you ever need more.
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", \
+# Binding to port 80 as a non-root user requires the
+# `net.ipv4.ip_unprivileged_port_start=0` sysctl, set in docker-compose.yml.
+CMD ["gunicorn", "--bind", "0.0.0.0:80", \
      "--workers", "2", "--threads", "4", \
      "--access-logfile", "-", "app:app"]

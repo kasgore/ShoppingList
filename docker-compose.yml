@@ -12,48 +12,49 @@
 services:
   shoppinglist:
     container_name: shoppinglist
-    # Build the image locally on the Docker host from the Dockerfile in
-    # this repo. Portainer Stacks → Repository clones the repo, runs
-    # `docker compose up`, which triggers the build. The explicit
-    # lowercase `image:` tag is required because Docker rejects derived
-    # tag names that contain capitals (the repo is "ShoppingList").
     build: .
     image: shoppinglist:latest
     restart: unless-stopped
-    ports:
-      - "5000:5000"
     environment:
       # Set this to a long random string in production. Used for Flask
       # flash messages — not a security boundary, but should not be
       # left as the default.
       SHOPPINGLIST_SECRET: "change-me-to-a-long-random-string"
     volumes:
-      # SQLite database lives here so it survives container rebuilds.
       - shoppinglist-data:/data
-      # Photos uploaded from phones live here.
       - shoppinglist-uploads:/app/static/uploads
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; \
-              sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/manifest.json',timeout=3).status==200 else 1)"]
+              sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/manifest.json',timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
+    # Allow the non-root `app` user to bind to port 80 inside the container.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
     networks:
-      - shoppinglist-net
+      lan:
+        # Static LAN IP for the container. Reach the app at
+        # http://192.168.5.7  (no port suffix needed — port 80).
+        ipv4_address: 192.168.5.7
 
 volumes:
   shoppinglist-data:
   shoppinglist-uploads:
 
 networks:
-  # Explicit subnet so Portainer environments that auto-assign endpoint
-  # IPs to containers don't fail the bridge with "user specified IP
-  # address is supported only when connecting to networks with user
-  # configured subnets".
-  shoppinglist-net:
-    driver: bridge
+  # macvlan: gives the container its own MAC + IP on the home LAN, so
+  # 192.168.5.7 is reachable from phones/laptops directly (not through
+  # the Docker host). Edit `parent:` to match your host's NIC if eth0
+  # is wrong (`ip link` lists candidates), and adjust subnet/gateway
+  # to match your actual home network.
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: 192.168.5.0/24
+          gateway: 192.168.5.1
