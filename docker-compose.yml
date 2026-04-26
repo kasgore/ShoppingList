@@ -17,6 +17,15 @@ services:
     restart: unless-stopped
     environment:
       SHOPPINGLIST_SECRET: "change-me-to-a-long-random-string"
+      # SEED_MODE controls how seed_data/ is applied to the volumes:
+      #   always  overwrite from baked-in seed on every container start
+      #           (good while iterating: local edits → push → redeploy
+      #           → Portainer matches local exactly)
+      #   auto    seed only when the volume is empty (first deploy / wipe)
+      #   never   leave volumes alone
+      # Flip this to "auto" once the family is using the deployed app
+      # so their additions don't get clobbered on every redeploy.
+      SEED_MODE: "always"
     volumes:
       - shoppinglist-data:/data
       - shoppinglist-uploads:/app/static/uploads
