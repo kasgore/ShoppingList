@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS meal_plan (
 );
 CREATE INDEX IF NOT EXISTS idx_meal_plan_date ON meal_plan(plan_date);
 CREATE INDEX IF NOT EXISTS idx_meal_plan_recipe_id ON meal_plan(recipe_id);
+
+CREATE TABLE IF NOT EXISTS purchase_history (
+    -- One row per ad-hoc add. Drives the "Quick Add" predictor on the
+    -- shopping list home page (recency + frequency scoring).
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT    NOT NULL,
+    unit       TEXT    NOT NULL DEFAULT '',
+    checked_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_purchase_history_name ON purchase_history(name);
+CREATE INDEX IF NOT EXISTS idx_purchase_history_checked_at
+    ON purchase_history(checked_at);
 """
 
 

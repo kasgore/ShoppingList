@@ -389,6 +389,55 @@ def _broadcast(event_type: str, data: str = "1") -> None:
             pass
 
 
+def _top_predicted_items(db, limit: int = 8) -> list[dict]:
+    """Return up to `limit` items the user is likely to want to add next.
+
+    Scoring blends recency and frequency over the last 90 days of
+    ad-hoc adds. Items already on the active shopping list are skipped
+    so we don't suggest duplicates of what's already there.
+
+    Pure SQL + Python, no ML. Magic feel comes from "you usually buy
+    bananas every Sunday" patterns surfacing as one-tap chips.
+    """
+    # What's already on the list — exclude these from suggestions.
+    on_list = {row["name"].strip().lower() for row in db.execute(
+        "SELECT name FROM adhoc_item"
+    ).fetchall()}
+
+    rows = db.execute(
+        "SELECT name, unit, COUNT(*) AS freq, "
+        "       MAX(checked_at) AS last_at "
+        "FROM purchase_history "
+        "WHERE checked_at >= datetime('now', '-90 days') "
+        "GROUP BY LOWER(name), unit "
+        "ORDER BY freq DESC, last_at DESC "
+        "LIMIT 50"
+    ).fetchall()
+    if not rows:
+        return []
+
+    now = datetime.utcnow()
+    scored: list[tuple[float, dict]] = []
+    for r in rows:
+        if r["name"].strip().lower() in on_list:
+            continue
+        try:
+            last = datetime.fromisoformat(r["last_at"])
+        except (TypeError, ValueError):
+            continue
+        days_ago = max(1, (now - last).days)
+        recency = 1.0 / days_ago
+        freq = min(1.0, r["freq"] / 8.0)
+        score = 0.6 * recency + 0.4 * freq
+        scored.append((score, {
+            "name": r["name"],
+            "unit": r["unit"],
+            "freq": r["freq"],
+        }))
+    scored.sort(key=lambda x: -x[0])
+    return [item for _, item in scored[:limit]]
+
+
 def _refresh_recipe_embedding(db, recipe_id: int) -> None:
     """Recompute and upsert the semantic embedding for a recipe.
 
@@ -582,6 +631,7 @@ def create_app() -> Flask:
         grouped = build_shopping_list(db)
         total_items = sum(len(v) for v in grouped.values())
         checked_count = sum(1 for items in grouped.values() for i in items if i.checked)
+        quick_add = _top_predicted_items(db, limit=8)
         return render_template(
             "index.html",
             recipes=recipes,
@@ -590,6 +640,7 @@ def create_app() -> Flask:
             categories=CATEGORIES,
             total_items=total_items,
             checked_count=checked_count,
+            quick_add=quick_add,
         )
 
     @app.route("/recipes")
@@ -1532,6 +1583,12 @@ def create_app() -> Flask:
             "INSERT INTO adhoc_item (name, quantity, unit, category, note, added_by) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (name, qty, unit, category, note, added_by),
+        )
+        # Record the add as a "purchase event" — drives the Quick Add
+        # predictor on the home page (recency + frequency scoring).
+        db.execute(
+            "INSERT INTO purchase_history (name, unit) VALUES (?, ?)",
+            (name, unit),
         )
         db.commit()
         _broadcast("list_changed")

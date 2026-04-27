@@ -51,6 +51,28 @@
   <section class="card">
     <h2>Add an ad-hoc item</h2>
     <p class="muted">Need a Diet Coke? Toilet paper? Add it here without a recipe.</p>
+
+    {% if quick_add %}
+      <div class="quick-add">
+        <p class="muted small-note">Quick add — things you've bought recently:</p>
+        <ul class="quick-add-chips">
+          {% for item in quick_add %}
+            <li>
+              <form action="{{ url_for('list_add_adhoc') }}" method="post" class="inline">
+                <input type="hidden" name="name" value="{{ item.name }}">
+                <input type="hidden" name="quantity" value="1">
+                <input type="hidden" name="unit" value="{{ item.unit }}">
+                <button type="submit" class="chip-btn"
+                        title="Add {{ item.name }} to the list">
+                  + {{ item.name }}
+                </button>
+              </form>
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+
     <form action="{{ url_for('list_add_adhoc') }}" method="post" class="stack">
       <label>
         <span>What do you need?</span>

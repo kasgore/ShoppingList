@@ -742,6 +742,39 @@ code {
   .card { box-shadow: none; border: none; }
 }
 
+/* Quick-add predictor chips on the home page */
+.quick-add {
+  margin: 8px 0 16px;
+  padding: 10px 12px;
+  background: #f5fbf5;
+  border: 1px solid #c8e6c9;
+  border-radius: 8px;
+}
+.quick-add .small-note { margin: 0 0 6px; color: var(--ink); }
+.quick-add-chips {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.quick-add-chips li { margin: 0; }
+.chip-btn {
+  background: #fff;
+  border: 1px solid var(--accent);
+  border-radius: 16px;
+  padding: 4px 12px;
+  font-size: 0.85rem;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 500;
+}
+.chip-btn:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
 /* Meal plan calendar */
 .plan-grid {
   display: grid;
