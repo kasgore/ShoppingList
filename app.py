@@ -6,12 +6,11 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
+import zipfile
 from collections import defaultdict
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from fractions import Fraction
-from typing import Iterable
 
 from flask import (
     Flask,
@@ -22,25 +21,32 @@ from flask import (
     redirect,
     render_template,
     request,
+    send_file,
     send_from_directory,
     url_for,
 )
 
-# Register HEIC/HEIF support so iPhone photos (the default camera format
-# on iOS 11+) open through Pillow without conversion. Optional dep; the
-# rest of the app still works for JPEG/PNG/WebP if it's not installed.
-try:
-    import pillow_heif  # type: ignore[import-untyped]
-
-    pillow_heif.register_heif_opener()
-except Exception:
-    pass
+from db import DB_PATH, close_db, get_db, init_db
+from ingredient import (
+    CATEGORIES,
+    UNIT_ALIASES,
+    format_quantity,
+    guess_category,
+    normalize_name,
+    normalize_unit,
+    parse_ingredient,
+)
+from ocr import _ocr_image_to_text, _parse_ocr_recipe
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("SHOPPINGLIST_DB", os.path.join(APP_DIR, "shoppinglist.db"))
 UPLOAD_DIR = os.path.join(APP_DIR, "static", "uploads")
 ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8 MB
+# Defensive caps so a fat-fingered "999999" doesn't aggregate into the
+# shopping list as 999,999 cups of flour. 100 batches is a generous
+# upper bound for any sane family use case.
+MAX_MULTIPLIER = 100
+MAX_QUANTITY = 1000
 
 RECIPE_CATEGORIES = [
     "Breakfast",
@@ -55,635 +61,6 @@ RECIPE_CATEGORIES = [
     "Drink",
     "Other",
 ]
-
-CATEGORIES = [
-    "Produce",
-    "Meat & Seafood",
-    "Dairy & Eggs",
-    "Bakery",
-    "Pantry",
-    "Frozen",
-    "Beverages",
-    "Snacks",
-    "Household",
-    "Other",
-]
-
-# Unit normalization for nicer aggregation. Keys are lower-case.
-UNIT_ALIASES = {
-    "": "",
-    "ea": "",
-    "each": "",
-    "ct": "",
-    "count": "",
-    "tsp": "tsp",
-    "teaspoon": "tsp",
-    "teaspoons": "tsp",
-    "tbsp": "tbsp",
-    "tablespoon": "tbsp",
-    "tablespoons": "tbsp",
-    "c": "cup",
-    "cup": "cup",
-    "cups": "cup",
-    "oz": "oz",
-    "ounce": "oz",
-    "ounces": "oz",
-    "lb": "lb",
-    "lbs": "lb",
-    "pound": "lb",
-    "pounds": "lb",
-    "g": "g",
-    "gram": "g",
-    "grams": "g",
-    "kg": "kg",
-    "ml": "ml",
-    "l": "l",
-    "liter": "l",
-    "liters": "l",
-    "pinch": "pinch",
-    "dash": "dash",
-    "clove": "clove",
-    "cloves": "clove",
-    "can": "can",
-    "cans": "can",
-    "jar": "jar",
-    "jars": "jar",
-    "pkg": "pkg",
-    "package": "pkg",
-    "packages": "pkg",
-    "bottle": "bottle",
-    "bottles": "bottle",
-    "bunch": "bunch",
-    "bunches": "bunch",
-    "head": "head",
-    "heads": "head",
-    "slice": "slice",
-    "slices": "slice",
-    "stick": "stick",
-    "sticks": "stick",
-}
-
-
-def normalize_unit(unit: str | None) -> str:
-    if not unit:
-        return ""
-    return UNIT_ALIASES.get(unit.strip().lower(), unit.strip().lower())
-
-
-def normalize_name(name: str) -> str:
-    return name.strip().lower()
-
-
-def format_quantity(qty: float) -> str:
-    """Format a float quantity as a friendly fraction-aware string.
-
-    Snaps to common cooking fractions in order of simplicity: halves,
-    thirds, quarters, sixths, eighths. The first denominator whose
-    nearest fraction is within tolerance wins so 0.5 stays "1/2" and
-    doesn't become "4/8". 0.333 → "1/3", 0.667 → "2/3", etc.
-    """
-    if qty <= 0:
-        return ""
-    whole = int(qty)
-    frac = qty - whole
-    if abs(frac) < 0.01:
-        return str(whole)
-    for denom in (2, 3, 4, 6, 8):
-        num = round(frac * denom)
-        if 1 <= num < denom and abs(frac - num / denom) < 0.02:
-            f = Fraction(num, denom)
-            if whole:
-                return f"{whole} {f.numerator}/{f.denominator}"
-            return f"{f.numerator}/{f.denominator}"
-    # Fall back to a tidy decimal.
-    text = f"{qty:.2f}".rstrip("0").rstrip(".")
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Ingredient string parsing (for URL import)
-# ---------------------------------------------------------------------------
-
-# Unicode vulgar fractions → decimal value.
-VULGAR_FRACTIONS = {
-    "½": 0.5, "⅓": 1 / 3, "⅔": 2 / 3, "¼": 0.25, "¾": 0.75,
-    "⅕": 0.2, "⅖": 0.4, "⅗": 0.6, "⅘": 0.8,
-    "⅙": 1 / 6, "⅚": 5 / 6, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
-}
-
-_QTY_TOKEN = re.compile(
-    r"^\s*("
-    r"\d+\s+\d+/\d+"      # mixed: "1 1/2"
-    r"|\d+/\d+"           # fraction: "1/2"
-    r"|\d+(?:\.\d+)?"     # decimal: "1" or "1.5"
-    r")"
-)
-
-
-def _parse_quantity_token(text: str) -> tuple[float | None, str]:
-    """Pull a leading quantity off `text`. Returns (qty, remainder)."""
-    text = text.lstrip()
-    # Vulgar fraction at start (possibly preceded by integer, e.g., "1 ½").
-    m = re.match(r"^(\d+)\s*([" + "".join(VULGAR_FRACTIONS) + r"])", text)
-    if m:
-        qty = int(m.group(1)) + VULGAR_FRACTIONS[m.group(2)]
-        return qty, text[m.end():]
-    if text and text[0] in VULGAR_FRACTIONS:
-        return VULGAR_FRACTIONS[text[0]], text[1:]
-    m = _QTY_TOKEN.match(text)
-    if not m:
-        return None, text
-    raw = m.group(1)
-    rest = text[m.end():]
-    try:
-        if " " in raw:  # mixed
-            whole, frac = raw.split()
-            n, d = frac.split("/")
-            return float(int(whole) + int(n) / int(d)), rest
-        if "/" in raw:
-            n, d = raw.split("/")
-            return int(n) / int(d), rest
-        return float(raw), rest
-    except (ValueError, ZeroDivisionError):
-        return None, text
-
-
-def parse_ingredient(line: str) -> dict:
-    """Parse a free-form ingredient string like '1 1/2 cups flour, sifted'
-    into {name, quantity, unit, note}. Best-effort; the user can fix up
-    anything that looks off in the edit form."""
-    original = line.strip()
-    if not original:
-        return {"name": "", "quantity": 1.0, "unit": "", "note": ""}
-    # Strip a leading bullet/dash decoration from photo OCR or pasted lists.
-    # Must happen before quantity parsing — otherwise "- 1 pound" yields no qty.
-    original = re.sub(r"^[-*•·–—]+\s*", "", original)
-
-    qty, rest = _parse_quantity_token(original)
-    # Sometimes recipes use a range like "1-2 cups" — take the larger.
-    if qty is not None:
-        m = re.match(r"^\s*[-–to]+\s*", rest)
-        if m:
-            rest2 = rest[m.end():]
-            qty2, rest3 = _parse_quantity_token(rest2)
-            if qty2 is not None:
-                qty = qty2
-                rest = rest3
-
-    rest = rest.strip()
-
-    # Note after a comma is preserved separately.
-    note = ""
-    if "," in rest:
-        head, _, tail = rest.partition(",")
-        rest, note = head.strip(), tail.strip()
-
-    # Drop a leading "of " ("1 cup of flour").
-    rest = re.sub(r"^of\s+", "", rest, flags=re.I)
-
-    # First word might be a unit.
-    unit = ""
-    parts = rest.split(None, 1)
-    if parts:
-        raw_first = parts[0].rstrip(".")
-        # Recipe cards use "T" for tablespoon and "t" for teaspoon — the
-        # case is the only distinguishing signal, so treat these before
-        # lowercasing.
-        case_aliases = {"T": "tbsp", "t": "tsp", "Tb": "tbsp", "Tbs": "tbsp"}
-        if raw_first in case_aliases:
-            unit = case_aliases[raw_first]
-            rest = parts[1] if len(parts) > 1 else ""
-        else:
-            candidate = raw_first.lower()
-            if candidate in UNIT_ALIASES:
-                unit = UNIT_ALIASES[candidate]
-                rest = parts[1] if len(parts) > 1 else ""
-
-    name = rest.strip()
-    if not name:
-        # Couldn't separate — fall back to the whole line as the name.
-        name = original
-
-    return {
-        "name": name,
-        "quantity": qty if qty is not None else 1.0,
-        "unit": unit,
-        "note": note,
-    }
-
-
-def guess_category(name: str) -> str:
-    """Lightweight keyword classifier so imported items don't all default
-    to 'Other'. Users can correct anything wrong on the edit page."""
-    n = name.lower()
-    rules = [
-        ("Produce", [
-            # Greens & lettuces
-            "arugula", "rocket", "lettuce", "romaine", "iceberg", "spinach",
-            "kale", "chard", "collard", "endive", "watercress", "frisee",
-            "radicchio", "mesclun", "microgreen", "sprouts",
-            # Herbs (fresh)
-            "basil", "parsley", "cilantro", "mint", "dill", "thyme",
-            "rosemary", "sage", "oregano", "tarragon", "chive", "scallion",
-            "green onion", "leek", "shallot",
-            # Cruciferous & alliums
-            "broccoli", "cauliflower", "cabbage", "brussels", "bok choy",
-            "onion", "garlic", "fennel",
-            # Roots & tubers
-            "potato", "sweet potato", "yam", "carrot", "beet", "turnip",
-            "parsnip", "radish", "ginger", "turmeric", "rutabaga",
-            "jicama", "kohlrabi",
-            # Squash family
-            "zucchini", "squash", "pumpkin", "cucumber", "eggplant",
-            # Peppers (fresh)
-            "bell pepper", "jalapeno", "jalapeño", "serrano", "habanero",
-            "poblano", "chili pepper", "chile pepper", "anaheim",
-            # Tomatoes (fresh)
-            "tomato", "cherry tomato", "grape tomato",
-            # Other vegetables
-            "celery", "asparagus", "artichoke", "okra", "snap pea",
-            "snow pea", "green bean", "pea pod", "corn on the cob",
-            "mushroom", "shiitake", "portobello", "cremini",
-            # Fruit
-            "apple", "banana", "orange", "lemon", "lime", "grapefruit",
-            "berry", "strawberry", "blueberry", "raspberry", "blackberry",
-            "grape", "melon", "watermelon", "cantaloupe", "honeydew",
-            "peach", "plum", "pear", "pineapple", "mango", "kiwi",
-            "papaya", "avocado", "cherry", "apricot", "fig", "date",
-            "pomegranate", "coconut", "fresh herb",
-        ]),
-        ("Meat & Seafood", [
-            "beef", "steak", "ribeye", "sirloin", "brisket", "filet",
-            "ground beef", "ground turkey", "ground pork", "ground chicken",
-            "chicken", "drumstick", "thigh", "wing", "breast",
-            "pork", "bacon", "ham", "prosciutto", "pancetta", "sausage",
-            "chorizo", "kielbasa", "hot dog", "pepperoni", "salami",
-            "turkey", "lamb", "veal", "duck",
-            "shrimp", "prawn", "fish", "salmon", "tuna", "cod", "tilapia",
-            "trout", "halibut", "scallop", "crab", "lobster", "clam",
-            "mussel", "oyster", "anchovy", "sardine",
-        ]),
-        ("Dairy & Eggs", [
-            "milk", "buttermilk", "half and half", "half-and-half",
-            "cream", "heavy cream", "sour cream", "whipping cream",
-            "butter", "ghee", "margarine",
-            "cheese", "parmesan", "mozzarella", "cheddar", "gouda",
-            "swiss cheese", "feta", "ricotta", "cottage cheese",
-            "cream cheese", "blue cheese", "brie", "provolone",
-            "asiago", "pepper jack", "monterey jack",
-            "yogurt", "greek yogurt", "kefir",
-            "egg", "eggs",
-        ]),
-        ("Bakery", [
-            "bread", "loaf", "baguette", "ciabatta", "sourdough", "bun",
-            "buns", "tortilla", "pita", "naan", "bagel", "roll", "rolls",
-            "english muffin", "croissant", "biscuits",
-        ]),
-        ("Frozen", [
-            "frozen", "ice cream", "popsicle", "frozen pizza",
-            "frozen vegetables", "frozen fruit",
-        ]),
-        ("Beverages", [
-            "coke", "diet coke", "pepsi", "soda", "sparkling water",
-            "seltzer", "juice", "lemonade", "milk alternative",
-            "almond milk", "oat milk", "soy milk", "coconut milk drink",
-            "wine", "beer", "cider", "champagne", "prosecco",
-            "coffee", "espresso", "tea", "matcha", "kombucha",
-            "energy drink", "gatorade", "powerade",
-        ]),
-        ("Snacks", [
-            "chip", "chips", "cracker", "crackers", "cookie", "cookies",
-            "pretzel", "popcorn", "granola bar", "trail mix",
-            "candy", "chocolate bar", "gum",
-        ]),
-        ("Pantry", [
-            # Baking
-            "flour", "all-purpose", "bread flour", "cake flour",
-            "sugar", "brown sugar", "powdered sugar", "confectioners",
-            "baking powder", "baking soda", "yeast", "cocoa",
-            "chocolate chip", "vanilla", "vanilla extract", "almond extract",
-            # Seasonings (dry)
-            "salt", "kosher salt", "sea salt", "black pepper",
-            "white pepper", "peppercorn", "cinnamon", "nutmeg",
-            "paprika", "cumin", "coriander", "cardamom", "clove",
-            "bay leaf", "red pepper flake", "chili powder",
-            "garlic powder", "onion powder", "italian seasoning",
-            "taco seasoning", "fajita seasoning", "old bay",
-            "everything bagel seasoning", "spice", "seasoning",
-            # Oils & vinegars
-            "olive oil", "vegetable oil", "canola oil", "sesame oil",
-            "avocado oil", "coconut oil", "oil",
-            "vinegar", "balsamic", "rice vinegar", "apple cider vinegar",
-            # Sauces & condiments
-            "ketchup", "mustard", "mayo", "mayonnaise", "soy sauce",
-            "worcestershire", "hot sauce", "sriracha", "bbq sauce",
-            "barbecue sauce", "salsa", "tomato sauce", "tomato paste",
-            "marinara", "pasta sauce", "pesto", "alfredo sauce",
-            "fish sauce", "oyster sauce", "hoisin", "teriyaki",
-            "salad dressing", "ranch dressing", "italian dressing",
-            "honey", "maple syrup", "syrup", "jam", "jelly",
-            "peanut butter", "almond butter", "nutella",
-            # Grains & legumes
-            "pasta", "spaghetti", "penne", "rigatoni", "fettuccine",
-            "linguine", "lasagna noodle", "noodle", "ramen", "udon",
-            "rice", "basmati", "jasmine", "wild rice", "quinoa",
-            "couscous", "barley", "oats", "oatmeal",
-            "bean", "lentil", "chickpea", "garbanzo", "kidney bean",
-            "black bean", "pinto bean",
-            # Canned & jarred
-            "canned", "can of", "broth", "stock", "bouillon",
-            "crushed tomatoes", "diced tomatoes", "tomato puree",
-            "coconut milk", "evaporated milk", "condensed milk",
-            "olives", "capers", "pickles",
-            # Nuts & seeds
-            "almond", "walnut", "pecan", "cashew", "pistachio", "peanut",
-            "pine nut", "sunflower seed", "pumpkin seed", "chia",
-            "flaxseed", "sesame seed",
-            # Misc dry
-            "cereal", "granola", "breadcrumb", "croutons", "stuffing",
-        ]),
-        ("Household", [
-            "paper towel", "toilet paper", "tissue", "napkin", "foil",
-            "plastic wrap", "parchment", "ziploc", "trash bag",
-            "dish soap", "laundry detergent", "bleach", "sponge",
-            "toothpaste", "toothbrush", "shampoo", "conditioner",
-            "soap", "deodorant",
-        ]),
-    ]
-    for category, words in rules:
-        for w in words:
-            if re.search(r"\b" + re.escape(w) + r"\b", n):
-                return category
-    return "Other"
-
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS recipe (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    name         TEXT    NOT NULL UNIQUE,
-    description  TEXT    DEFAULT '',
-    servings     INTEGER NOT NULL DEFAULT 4,
-    instructions TEXT    DEFAULT '',
-    source_url   TEXT    DEFAULT '',
-    image_url    TEXT    DEFAULT '',
-    prep_time    INTEGER NOT NULL DEFAULT 0,
-    cook_time    INTEGER NOT NULL DEFAULT 0,
-    total_time   INTEGER NOT NULL DEFAULT 0,
-    category     TEXT    DEFAULT '',
-    notes        TEXT    DEFAULT '',
-    is_favorite  INTEGER NOT NULL DEFAULT 0,
-    rating       INTEGER NOT NULL DEFAULT 0,
-    nutrition    TEXT    DEFAULT '',
-    yields_text  TEXT    DEFAULT '',
-    cuisine      TEXT    DEFAULT '',
-    author       TEXT    DEFAULT '',
-    source_rating REAL   NOT NULL DEFAULT 0,
-    keywords     TEXT    DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS ingredient (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipe_id INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
-    name      TEXT    NOT NULL,
-    quantity  REAL    NOT NULL DEFAULT 1,
-    unit      TEXT    NOT NULL DEFAULT '',
-    category  TEXT    NOT NULL DEFAULT 'Other',
-    note      TEXT    DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS list_recipe (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipe_id  INTEGER NOT NULL REFERENCES recipe(id) ON DELETE CASCADE,
-    multiplier REAL    NOT NULL DEFAULT 1,
-    added_by   TEXT    DEFAULT '',
-    added_at   TEXT    DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS adhoc_item (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    name      TEXT    NOT NULL,
-    quantity  REAL    NOT NULL DEFAULT 1,
-    unit      TEXT    NOT NULL DEFAULT '',
-    category  TEXT    NOT NULL DEFAULT 'Other',
-    note      TEXT    DEFAULT '',
-    added_by  TEXT    DEFAULT '',
-    added_at  TEXT    DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS checked_item (
-    -- Stores which aggregated keys have been checked off.
-    -- key format:  recipe::<name>::<unit>   or   adhoc::<id>
-    key TEXT PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS meal_plan (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_date  TEXT    NOT NULL,                       -- YYYY-MM-DD
-    slot       TEXT    NOT NULL DEFAULT '',            -- "Dinner", etc. (free-form)
-    recipe_id  INTEGER REFERENCES recipe(id) ON DELETE CASCADE,
-    text_plan  TEXT    NOT NULL DEFAULT '',            -- ad-hoc text when no recipe
-    multiplier REAL    NOT NULL DEFAULT 1,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT    DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_meal_plan_date ON meal_plan(plan_date);
-"""
-
-
-def get_db() -> sqlite3.Connection:
-    if "db" not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        g.db = conn
-    return g.db
-
-
-def close_db(_exc=None) -> None:
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-def init_db() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.executescript(SCHEMA)
-        # Idempotent migrations for older DBs created before these columns.
-        existing = {
-            row[1] for row in conn.execute("PRAGMA table_info(recipe)").fetchall()
-        }
-        migrations = [
-            ("instructions", "ALTER TABLE recipe ADD COLUMN instructions TEXT DEFAULT ''"),
-            ("source_url", "ALTER TABLE recipe ADD COLUMN source_url TEXT DEFAULT ''"),
-            ("image_url", "ALTER TABLE recipe ADD COLUMN image_url TEXT DEFAULT ''"),
-            ("prep_time", "ALTER TABLE recipe ADD COLUMN prep_time INTEGER NOT NULL DEFAULT 0"),
-            ("cook_time", "ALTER TABLE recipe ADD COLUMN cook_time INTEGER NOT NULL DEFAULT 0"),
-            ("total_time", "ALTER TABLE recipe ADD COLUMN total_time INTEGER NOT NULL DEFAULT 0"),
-            ("category", "ALTER TABLE recipe ADD COLUMN category TEXT DEFAULT ''"),
-            ("notes", "ALTER TABLE recipe ADD COLUMN notes TEXT DEFAULT ''"),
-            ("is_favorite", "ALTER TABLE recipe ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0"),
-            ("rating", "ALTER TABLE recipe ADD COLUMN rating INTEGER NOT NULL DEFAULT 0"),
-            ("nutrition", "ALTER TABLE recipe ADD COLUMN nutrition TEXT DEFAULT ''"),
-            ("yields_text", "ALTER TABLE recipe ADD COLUMN yields_text TEXT DEFAULT ''"),
-            ("cuisine", "ALTER TABLE recipe ADD COLUMN cuisine TEXT DEFAULT ''"),
-            ("author", "ALTER TABLE recipe ADD COLUMN author TEXT DEFAULT ''"),
-            ("source_rating", "ALTER TABLE recipe ADD COLUMN source_rating REAL NOT NULL DEFAULT 0"),
-            ("keywords", "ALTER TABLE recipe ADD COLUMN keywords TEXT DEFAULT ''"),
-        ]
-        for col, ddl in migrations:
-            if col not in existing:
-                conn.execute(ddl)
-        conn.commit()
-        # Seed if empty.
-        count = conn.execute("SELECT COUNT(*) FROM recipe").fetchone()[0]
-        if count == 0:
-            seed_recipes(conn)
-            conn.commit()
-
-        # Re-classify any ingredient or ad-hoc item still sitting in 'Other'
-        # using the latest keyword rules. Safe to run repeatedly: rows that
-        # remain unmatched stay as 'Other'.
-        for table in ("ingredient", "adhoc_item"):
-            rows = conn.execute(
-                f"SELECT id, name FROM {table} WHERE category = 'Other'"
-            ).fetchall()
-            for row in rows:
-                guessed = guess_category(row[1])
-                if guessed != "Other":
-                    conn.execute(
-                        f"UPDATE {table} SET category = ? WHERE id = ?",
-                        (guessed, row[0]),
-                    )
-        conn.commit()
-
-
-def seed_recipes(conn: sqlite3.Connection) -> None:
-    """Pre-populate a handful of family-friendly recipes so the app is
-    immediately useful out of the box."""
-    seeds = [
-        {
-            "name": "Spaghetti Bolognese",
-            "description": "Classic weeknight pasta with meat sauce.",
-            "servings": 4,
-            "ingredients": [
-                ("Spaghetti", 1, "lb", "Pantry"),
-                ("Ground beef", 1, "lb", "Meat & Seafood"),
-                ("Yellow onion", 1, "", "Produce"),
-                ("Garlic", 3, "clove", "Produce"),
-                ("Crushed tomatoes", 28, "oz", "Pantry"),
-                ("Tomato paste", 2, "tbsp", "Pantry"),
-                ("Olive oil", 2, "tbsp", "Pantry"),
-                ("Parmesan cheese", 4, "oz", "Dairy & Eggs"),
-                ("Salt", 1, "tsp", "Pantry"),
-                ("Black pepper", 1, "tsp", "Pantry"),
-            ],
-        },
-        {
-            "name": "Taco Tuesday",
-            "description": "Family taco night, hard or soft shells.",
-            "servings": 4,
-            "ingredients": [
-                ("Ground beef", 1, "lb", "Meat & Seafood"),
-                ("Taco seasoning", 1, "pkg", "Pantry"),
-                ("Taco shells", 12, "", "Pantry"),
-                ("Shredded cheddar", 8, "oz", "Dairy & Eggs"),
-                ("Lettuce", 1, "head", "Produce"),
-                ("Tomato", 2, "", "Produce"),
-                ("Sour cream", 8, "oz", "Dairy & Eggs"),
-                ("Salsa", 16, "oz", "Pantry"),
-            ],
-        },
-        {
-            "name": "Chicken Alfredo",
-            "description": "Creamy fettuccine alfredo with grilled chicken.",
-            "servings": 4,
-            "ingredients": [
-                ("Fettuccine", 1, "lb", "Pantry"),
-                ("Chicken breast", 1.5, "lb", "Meat & Seafood"),
-                ("Heavy cream", 2, "cup", "Dairy & Eggs"),
-                ("Butter", 4, "tbsp", "Dairy & Eggs"),
-                ("Parmesan cheese", 6, "oz", "Dairy & Eggs"),
-                ("Garlic", 4, "clove", "Produce"),
-                ("Olive oil", 2, "tbsp", "Pantry"),
-                ("Salt", 1, "tsp", "Pantry"),
-                ("Black pepper", 1, "tsp", "Pantry"),
-                ("Parsley", 1, "bunch", "Produce"),
-            ],
-        },
-        {
-            "name": "Sheet Pan Fajitas",
-            "description": "Easy oven-baked chicken fajitas.",
-            "servings": 4,
-            "ingredients": [
-                ("Chicken breast", 1.5, "lb", "Meat & Seafood"),
-                ("Bell pepper", 3, "", "Produce"),
-                ("Yellow onion", 1, "", "Produce"),
-                ("Flour tortillas", 8, "", "Bakery"),
-                ("Fajita seasoning", 1, "pkg", "Pantry"),
-                ("Olive oil", 2, "tbsp", "Pantry"),
-                ("Lime", 2, "", "Produce"),
-                ("Cilantro", 1, "bunch", "Produce"),
-            ],
-        },
-        {
-            "name": "Sunday Pancakes",
-            "description": "Fluffy buttermilk pancakes for the whole family.",
-            "servings": 4,
-            "ingredients": [
-                ("All-purpose flour", 2, "cup", "Pantry"),
-                ("Sugar", 2, "tbsp", "Pantry"),
-                ("Baking powder", 2, "tsp", "Pantry"),
-                ("Salt", 0.5, "tsp", "Pantry"),
-                ("Buttermilk", 2, "cup", "Dairy & Eggs"),
-                ("Eggs", 2, "", "Dairy & Eggs"),
-                ("Butter", 4, "tbsp", "Dairy & Eggs"),
-                ("Maple syrup", 8, "oz", "Pantry"),
-            ],
-        },
-        {
-            "name": "Garden Salad",
-            "description": "Fresh side salad.",
-            "servings": 4,
-            "ingredients": [
-                ("Romaine lettuce", 1, "head", "Produce"),
-                ("Cucumber", 1, "", "Produce"),
-                ("Cherry tomatoes", 1, "pkg", "Produce"),
-                ("Carrot", 2, "", "Produce"),
-                ("Red onion", 0.5, "", "Produce"),
-                ("Salad dressing", 1, "bottle", "Pantry"),
-            ],
-        },
-        {
-            "name": "BBQ Chicken Sandwiches",
-            "description": "Pulled BBQ chicken on brioche buns.",
-            "servings": 4,
-            "ingredients": [
-                ("Chicken breast", 2, "lb", "Meat & Seafood"),
-                ("BBQ sauce", 18, "oz", "Pantry"),
-                ("Brioche buns", 4, "", "Bakery"),
-                ("Coleslaw mix", 14, "oz", "Produce"),
-                ("Mayonnaise", 0.5, "cup", "Pantry"),
-                ("Apple cider vinegar", 2, "tbsp", "Pantry"),
-            ],
-        },
-    ]
-
-    for r in seeds:
-        cur = conn.execute(
-            "INSERT INTO recipe (name, description, servings) VALUES (?, ?, ?)",
-            (r["name"], r["description"], r["servings"]),
-        )
-        rid = cur.lastrowid
-        for name, qty, unit, category in r["ingredients"]:
-            conn.execute(
-                "INSERT INTO ingredient (recipe_id, name, quantity, unit, category) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (rid, name, qty, unit, category),
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -859,426 +236,54 @@ def _scrape_notes_section(soup) -> str:
     return ""
 
 
-_OCR_INGREDIENT_HEAD_RE = re.compile(
-    r"^\s*(?:[-*•·]\s*)?"
-    r"(?:\d+(?:[\s./]\d+)?|[½⅓⅔¼¾⅛⅜⅝⅞])"
-    r"|^\s*(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-    re.IGNORECASE,
-)
-_OCR_UNIT_HINT_RE = re.compile(
-    r"\b(?:cup|cups|c|tsp|teaspoon|tbsp|tablespoon|oz|ounce|lb|pound|"
-    r"g|gram|kg|ml|l|liter|litre|pinch|dash|clove|cloves|can|cans|pkg|"
-    r"package|stick|sticks|slice|slices|bunch|head|piece)s?\b",
-    re.IGNORECASE,
-)
-_OCR_HEADER_RE = re.compile(
-    # Tolerates OCR typos: "Ingrdients", "lngredienta" (l-for-I, vowels
-    # dropped, trailing 'a' for 's'). Same for "Directions" → "Dirediono".
-    r"^\s*['\"]?\s*"  # optional leading quote/apostrophe noise
-    r"([il]ngr[a-z]*ent[a-z]*|"
-    r"dire[a-z]*ion[a-z]*|instructions?|method|preparation|steps?|"
-    r"notes?|you[' ]?ll need)\s*[:.]?\s*$",
-    re.IGNORECASE,
-)
-# Numbered step like "1.", "1)", "Step 1", "Step 1:".
-_OCR_STEP_RE = re.compile(
-    r"^\s*(?:step\s+)?\d{1,2}\s*[).:]\s+",
-    re.IGNORECASE,
-)
-# Recipe-card metadata lines we can promote to structured fields.
-_OCR_SERVES_RE = re.compile(
-    r"\b(?:serves|servings?|yield(?:s)?|makes)\s*[:\-]?\s*(\d+)",
-    re.IGNORECASE,
-)
-_OCR_PREP_RE = re.compile(
-    r"\bprep\b[^\d\n]{0,30}(\d+\s*(?:hours?|hrs?|minutes?|mins?|h|m)\b)",
-    re.IGNORECASE,
-)
-_OCR_COOK_RE = re.compile(
-    r"\bcook\b[^\d\n]{0,30}(\d+\s*(?:hours?|hrs?|minutes?|mins?|h|m)\b)",
-    re.IGNORECASE,
-)
-_OCR_TOTAL_RE = re.compile(
-    r"\btotal\b[^\d\n]{0,30}(\d+\s*(?:hours?|hrs?|minutes?|mins?|h|m)\b)",
-    re.IGNORECASE,
-)
-# Lines that are pure garbage from low-contrast / edge artifacts: a couple
-# of stray punctuation chars or single letters with no real content.
-_OCR_JUNK_RE = re.compile(r"^[\s\W_]{0,4}$")
-
-
-def _ocr_minutes_from_phrase(phrase: str) -> int:
-    """Convert '1 hr 20 min', '15 min', '30m' etc. to integer minutes."""
-    if not phrase:
-        return 0
-    s = str(phrase).lower()
-    hours = re.search(r"(\d+)\s*(?:h|hour|hr)", s)
-    mins = re.search(r"(\d+)\s*(?:m|min)", s)
-    if hours or mins:
-        return (int(hours.group(1)) if hours else 0) * 60 + (
-            int(mins.group(1)) if mins else 0
-        )
-    bare = re.search(r"\d+", s)
-    return int(bare.group(0)) if bare else 0
-
-
-def _clean_ocr_text(raw: str) -> str:
-    """Normalize obvious OCR artifacts before parsing.
-
-    Operations:
-      - Re-join words split by hyphens at line ends ("flav-\nored" → "flavored").
-      - Replace common Tesseract fraction misreads ("Y2" / "‘/2" → "1/2").
-      - Replace `+` between letters with `t` — printed cards in some fonts
-        consistently have Tesseract reading 't' as '+' ("bu++er" → "butter",
-        "+he" → "the"). Skipped between digits to avoid math expressions.
-      - Drop lines that are pure whitespace/punctuation, very short
-        (≤ 2 chars), or alphabetically sparse (< 25% letters).
-      - Collapse runs of 3+ blank lines to one.
-    """
-    if not raw:
-        return ""
-    # End-of-line hyphenation: "flav-\nored" → "flavored".
-    text = re.sub(r"-\n(?=\w)", "", raw)
-    # Fraction misreads.
-    text = re.sub(r"\bY2\b", "1/2", text)
-    text = re.sub(r"\bY4\b", "1/4", text)
-    text = re.sub(r"\bY3\b", "1/3", text)
-    # Curly/straight quote in front of a fraction ("‘/2 teaspoon") is the
-    # leading "1" — Tesseract regularly mangles serifed 1s into quotes.
-    text = re.sub(r"[‘'`´]/\s*2\b", "1/2", text)
-    text = re.sub(r"[‘'`´]/\s*4\b", "1/4", text)
-    text = re.sub(r"[‘'`´]/\s*3\b", "1/3", text)
-    # `+`-for-`t` substitution in word context (cards using fonts with
-    # cross-stroke t's confuse Tesseract). Don't touch math-like `digit+digit`.
-    def _plus_to_t(m: re.Match) -> str:
-        idx = m.start()
-        prev = text[idx - 1] if idx > 0 else " "
-        nxt = text[idx + 1] if idx + 1 < len(text) else " "
-        if prev.isdigit() and nxt.isdigit():
-            return "+"
-        if prev.isalpha() or nxt.isalpha() or prev == "+" or nxt == "+":
-            return "t"
-        return "+"
-    text = re.sub(r"\+", _plus_to_t, text)
-
-    cleaned_lines: list[str] = []
-    for ln in text.splitlines():
-        stripped = ln.strip()
-        if not stripped:
-            cleaned_lines.append("")
-            continue
-        # Junk filters: short noise, very short lines, alpha-sparse lines.
-        if _OCR_JUNK_RE.match(stripped):
-            continue
-        if len(stripped) <= 2:
-            continue
-        alpha = sum(1 for c in stripped if c.isalpha())
-        if len(stripped) >= 4 and alpha / len(stripped) < 0.25:
-            continue
-        cleaned_lines.append(stripped)
-    # Collapse triple-blank runs.
-    out_lines: list[str] = []
-    blank_run = 0
-    for ln in cleaned_lines:
-        if not ln:
-            blank_run += 1
-            if blank_run > 1:
-                continue
-        else:
-            blank_run = 0
-        out_lines.append(ln)
-    return "\n".join(out_lines).strip()
-
-
-def _looks_like_ingredient(line: str) -> bool:
-    """Heuristic: does this OCR line look like an ingredient row?
-
-    Matches lines that start with a quantity (digit, fraction, or 'a/an')
-    or that mention a common cooking unit. Short lines with neither rarely
-    parse cleanly so we treat them as instructions/prose."""
-    if not line.strip():
-        return False
-    if _OCR_INGREDIENT_HEAD_RE.search(line):
-        return True
-    if _OCR_UNIT_HINT_RE.search(line) and len(line.split()) <= 10:
-        return True
-    return False
-
-
-def _is_natural_word(s: str) -> bool:
-    """Return True if a letter run looks like a real word.
-
-    "Three", "CHEESE", and "oervinga" pass; "ClC" and "U" do not. Used
-    by title detection to reject OCR mixed-case soup that happens to
-    contain enough letters to fool a simple alpha-ratio check.
-    """
-    if len(s) < 3:
-        return False
-    if s.islower() or s.isupper():
-        return True
-    if s[0].isupper() and s[1:].islower():
-        return True
-    return False
-
-
-def _clean_ocr_title(line: str) -> str:
-    """Tidy a candidate title line lifted off a recipe card.
-
-    Strips leading punctuation noise OCR captures from card edges,
-    title-cases all-caps banners, and fixes the common ampersand misread
-    (`MAC 8: CHEESE` → `Mac & Cheese`) which is fairly safe in title
-    context but would be too aggressive in the body of the recipe.
-    """
-    if not line:
-        return ""
-    cleaned = re.sub(r"^[^A-Za-z0-9]+", "", line).strip()
-    # Card edges often produce a stray single letter followed by a slash
-    # or backslash (e.g. "A \\ HOMEMADE …"). Strip that pattern too —
-    # safe because real titles don't start with "letter \\".
-    cleaned = re.sub(r"^[A-Za-z]\s*[\\/|]+\s*", "", cleaned).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    # Common Tesseract misread on stylized title fonts: "&" → "8:" or "8".
-    cleaned = re.sub(r"\b8:\s+", "& ", cleaned)
-    cleaned = re.sub(r"(\w)\s+8\s+(\w)", r"\1 & \2", cleaned)
-    cleaned = cleaned[:120]
-    letters = [c for c in cleaned if c.isalpha()]
-    if letters and all(c.isupper() for c in letters):
-        cleaned = cleaned.title()
-    return cleaned
-
-
-def _parse_ocr_recipe(text: str) -> dict:
-    """Split raw OCR text into structured fields.
-
-    Returns a dict with: title, ingredients (list[str]), instructions (str),
-    servings (int|None), prep_time (int min), cook_time (int min),
-    total_time (int min). Heuristic — good enough to seed the edit screen.
-    """
-    cleaned = _clean_ocr_text(text)
-    # Keep blank lines this time — they're a strong signal of a section
-    # break (the gap between the ingredient block and the instructions).
-    cleaned_lines = cleaned.splitlines()
-    if not any(ln.strip() for ln in cleaned_lines):
-        return {
-            "title": "",
-            "ingredients": [],
-            "instructions": "",
-            "servings": None,
-            "prep_time": 0,
-            "cook_time": 0,
-            "total_time": 0,
+def _is_valid_kasa_db(path: str) -> bool:
+    """Quick smoke-test that `path` looks like a Kasa SQLite DB."""
+    try:
+        conn = sqlite3.connect(path)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
         }
-
-    # Pull metadata out and remove those lines from the body — they
-    # otherwise pollute the instructions block. Preserve blank lines.
-    servings = None
-    prep_time = 0
-    cook_time = 0
-    total_time = 0
-    body_lines: list[str] = []
-    for ln in cleaned_lines:
-        if not ln.strip():
-            body_lines.append("")
-            continue
-        m = _OCR_SERVES_RE.search(ln)
-        if m and servings is None:
-            try:
-                servings = int(m.group(1))
-            except ValueError:
-                pass
-            residue = _OCR_SERVES_RE.sub("", ln).strip(" \t·-:|")
-            # Don't echo back a bare unit word like "servings" / "serves".
-            if residue.lower() in {
-                "servings", "serving", "serves", "yield", "yields", "makes"
-            }:
-                residue = ""
-            if residue:
-                body_lines.append(residue)
-            continue
-        m = _OCR_PREP_RE.search(ln)
-        if m and not prep_time:
-            prep_time = _ocr_minutes_from_phrase(m.group(1))
-            continue
-        m = _OCR_COOK_RE.search(ln)
-        if m and not cook_time:
-            cook_time = _ocr_minutes_from_phrase(m.group(1))
-            continue
-        m = _OCR_TOTAL_RE.search(ln)
-        if m and not total_time:
-            total_time = _ocr_minutes_from_phrase(m.group(1))
-            continue
-        body_lines.append(ln)
-
-    if not total_time and (prep_time or cook_time):
-        total_time = prep_time + cook_time
-
-    # Title: scan the first few non-blank lines for one that holds at
-    # least 2 "natural" words (real-looking letter runs). This rejects
-    # OCR mixed-case soup like "ClC(U'0n.l 8-10 oervinga" so the user
-    # gets the "Imported Recipe" default instead of gibberish.
-    title = ""
-    title_idx = -1
-    non_blank_count = 0
-    MAX_TITLE_LOOKAHEAD = 5
-    for i, ln in enumerate(body_lines):
-        s = ln.strip()
-        if not s:
-            continue
-        non_blank_count += 1
-        if non_blank_count > MAX_TITLE_LOOKAHEAD:
-            break
-        # If we hit a section header or an ingredient line before finding
-        # a usable title, give up — no point hunting further.
-        if _OCR_HEADER_RE.match(s) or _looks_like_ingredient(s):
-            break
-        cleaned_title = _clean_ocr_title(s)
-        # Real titles are short. Anything > 60 chars is almost certainly
-        # an ingredients line that got jammed onto one OCR row.
-        if len(cleaned_title) < 3 or len(cleaned_title) > 60:
-            continue
-        runs = re.findall(r"[A-Za-z]+", cleaned_title)
-        natural = [r for r in runs if _is_natural_word(r)]
-        if len(natural) >= 2:
-            title = cleaned_title
-            title_idx = i
-            break
-    body = body_lines[title_idx + 1 :] if title_idx >= 0 else body_lines
-
-    section = "pre"  # pre | ing | inst
-    ing: list[str] = []
-    inst: list[str] = []
-    saw_blank = False
-    for ln in body:
-        if not ln.strip():
-            # Blank line: remember it so the next non-blank can decide
-            # whether the section is changing.
-            saw_blank = True
-            continue
-        # Explicit section headers (case-insensitive, OCR-typo tolerant).
-        header = _OCR_HEADER_RE.match(ln)
-        if header:
-            label = header.group(1).lower()
-            if "ngr" in label or label.startswith("you"):
-                section = "ing"
-            else:  # directions / instructions / method / steps / notes
-                section = "inst"
-            saw_blank = False
-            continue
-        # Numbered/Step lines are unambiguously instructions.
-        if _OCR_STEP_RE.match(ln):
-            section = "inst"
-            inst.append(ln)
-            saw_blank = False
-            continue
-        # Blank-line gap inside the ingredient block: switch to instructions
-        # only if the new line looks substantive (≥ 4 words). Single-word
-        # decorations like "MoreRecipeat" are dropped instead of bleeding
-        # into the instructions field.
-        if section == "ing" and saw_blank and not _looks_like_ingredient(ln):
-            if len(ln.split()) >= 4:
-                section = "inst"
-            else:
-                saw_blank = False
-                continue
-        if section == "ing":
-            if (
-                ing
-                and not saw_blank
-                and not _looks_like_ingredient(ln)
-                and len(ln.split()) <= 4
-            ):
-                ing[-1] = f"{ing[-1]} {ln}".strip()
-            else:
-                ing.append(ln)
-        elif section == "inst":
-            inst.append(ln)
-        else:  # section == "pre"
-            # Discard pre-section noise. Only promote to "ing" when we
-            # actually see an ingredient-shaped line — never let stylized
-            # title artifacts or OCR garbage become the instructions.
-            if _looks_like_ingredient(ln):
-                section = "ing"
-                ing.append(ln)
-            # else: drop the line entirely
-        saw_blank = False
-
-    return {
-        "title": title,
-        "ingredients": ing,
-        "instructions": "\n".join(inst).strip(),
-        "servings": servings,
-        "prep_time": prep_time,
-        "cook_time": cook_time,
-        "total_time": total_time,
-    }
+        conn.close()
+    except sqlite3.DatabaseError:
+        return False
+    return {"recipe", "ingredient", "list_recipe"}.issubset(tables)
 
 
-def _resolve_tesseract_cmd() -> str | None:
-    """Find the tesseract binary across dev/prod environments.
+def _write_full_backup_zip(zip_path: str) -> tuple[int, int]:
+    """Snapshot DB + uploaded photos into a ZIP at `zip_path`.
 
-    Order of resolution:
-      1. TESSERACT_CMD env var — explicit override always wins.
-      2. On Windows, probe known winget/installer locations (the binary
-         doesn't get added to PATH by the user-scope winget install).
-      3. Fall through to None — pytesseract will then call `tesseract`
-         from PATH, which is how the Linux container works.
+    Returns (photo_count, total_bytes). Raises on failure. The DB is
+    written via SQLite's Online Backup API so the snapshot is consistent
+    even if a write is in flight when the user clicks Download.
     """
-    env = os.environ.get("TESSERACT_CMD")
-    if env and os.path.isfile(env):
-        return env
-    if os.name == "nt":
-        candidates = [
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR", "tesseract.exe"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        ]
-        for path in candidates:
-            if path and os.path.isfile(path):
-                return path
-    return None
-
-
-def _ocr_image_to_text(disk_path: str) -> str:
-    """Run Tesseract on a saved image with preprocessing tuned for phone
-    photos of recipe cards. Tries PSM 6 (single block of uniform text)
-    first; falls back to PSM 3 (auto) if that fails or returns nothing."""
-    import pytesseract
-    from PIL import Image, ImageOps
-
-    resolved = _resolve_tesseract_cmd()
-    if resolved:
-        pytesseract.pytesseract.tesseract_cmd = resolved
-
-    img = Image.open(disk_path)
-    # iPhone photos carry orientation in EXIF — apply it before OCR.
-    img = ImageOps.exif_transpose(img)
-    # Tesseract LSTM does best around 1500–2000px tall. Upscale small
-    # images so phone shots and scaled-down uploads both read well.
-    target_h = 1800
-    if img.height < target_h:
-        ratio = target_h / img.height
-        img = img.resize(
-            (int(img.width * ratio), target_h), Image.LANCZOS
-        )
-    img = ImageOps.grayscale(img)
-    img = ImageOps.autocontrast(img, cutoff=2)
-
-    def _try(psm: int) -> str:
+    fd, tmp_db = tempfile.mkstemp(suffix=".db", prefix="kasa-snap-")
+    os.close(fd)
+    photo_count = 0
+    total_bytes = 0
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp_db)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(tmp_db, arcname="shoppinglist.db")
+            if os.path.isdir(UPLOAD_DIR):
+                for fname in os.listdir(UPLOAD_DIR):
+                    full = os.path.join(UPLOAD_DIR, fname)
+                    if os.path.isfile(full):
+                        zf.write(full, arcname=f"uploads/{fname}")
+                        photo_count += 1
+                        total_bytes += os.path.getsize(full)
+    finally:
         try:
-            return pytesseract.image_to_string(
-                img,
-                config=f"--oem 1 --psm {psm}",
-                timeout=30,
-            ) or ""
-        except Exception:
-            return ""
-
-    primary = _try(6)
-    if len(primary.strip()) >= 40:
-        return primary
-    fallback = _try(3)
-    return fallback if len(fallback.strip()) > len(primary.strip()) else primary
+            os.remove(tmp_db)
+        except OSError:
+            pass
+    return photo_count, total_bytes
 
 
 def _week_start(d: date) -> date:
@@ -1295,6 +300,79 @@ def _parse_iso_date(s: str | None) -> date:
         return datetime.strptime(s, "%Y-%m-%d").date()
     except ValueError:
         return date.today()
+
+
+def _parse_multiplier_field(
+    raw: str | None,
+    *,
+    allow_float: bool = True,
+    floor: float = 1.0,
+    cap: float = 100.0,
+    default: float = 1.0,
+) -> float:
+    """Parse a multiplier-style numeric field from a form.
+
+    Used by /list/add-recipe, /list/add-adhoc, and /plan/add — all of
+    which historically had their own subtly different parse-and-clamp
+    logic (some int-coerced, some kept floats, some had different
+    floors). One helper, three call sites.
+    """
+    s = (raw or "").strip() or str(default)
+    try:
+        value = float(s) if allow_float else float(int(float(s)))
+    except (TypeError, ValueError):
+        return default
+    return min(cap, max(floor, value))
+
+
+def _int_field(form, name: str, default: int = 0) -> int:
+    """Parse a non-negative integer from a Flask `request.form`-like
+    mapping. Returns `default` on bad input. Replaces the inline nested
+    helper that used to live inside `_save_recipe`."""
+    raw = (form.get(name, str(default)) or str(default)).strip() or str(default)
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Column list used by both /recipes/<id> and /recipes/<id>/edit. Defining
+# it once means a future schema addition only needs to be added here.
+_RECIPE_FETCH_COLUMNS = (
+    "id, name, description, servings, instructions, source_url, "
+    "image_url, prep_time, cook_time, total_time, category, notes, "
+    "is_favorite, rating, nutrition, yields_text, cuisine, author, "
+    "source_rating, keywords"
+)
+
+
+def _get_recipe(recipe_id: int):
+    """Fetch a recipe row by ID, or None. Used by the view and edit
+    routes — defines the column list once so schema additions don't
+    have to be made in two places."""
+    return get_db().execute(
+        f"SELECT {_RECIPE_FETCH_COLUMNS} FROM recipe WHERE id = ?",
+        (recipe_id,),
+    ).fetchone()
+
+
+def _validate_image_url(url: str) -> str:
+    """Allow only http(s) URLs or our own /static/uploads/ paths.
+
+    Anything else (javascript:, data:, file:, blob:, vbscript:, etc.) is
+    dropped silently. The recipe form's URL input is browser-validated as
+    a URL but the user can paste whatever; this is the server-side guard.
+    Defensive against future template changes that might render the URL
+    in a more dangerous attribute (e.g. an `<a href>`).
+    """
+    if not url:
+        return ""
+    url = url.strip()
+    if url.startswith("/static/uploads/"):
+        return url
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return ""
 
 
 def _save_uploaded_image(file_storage) -> str | None:
@@ -1317,9 +395,56 @@ def _save_uploaded_image(file_storage) -> str | None:
     return f"/static/uploads/{safe}"
 
 
+def _resolve_secret_key() -> str:
+    """Pick a stable Flask secret_key without requiring the user to set
+    SHOPPINGLIST_SECRET themselves.
+
+    Order of resolution:
+      1. SHOPPINGLIST_SECRET env var, if set to something other than the
+         shipped placeholder strings.
+      2. .secret_key file alongside the DB if it already exists.
+      3. Generate a fresh random key, persist it to .secret_key, return.
+
+    Falls back to an ephemeral in-memory key if /data/ isn't writable;
+    sessions invalidate on restart in that case, which is acceptable
+    degradation — family logs in again.
+    """
+    placeholders = {
+        "",
+        "family-shopping-dev-key",
+        "change-me-to-a-long-random-string",
+    }
+    env = os.environ.get("SHOPPINGLIST_SECRET", "").strip()
+    if env not in placeholders:
+        return env
+
+    secret_dir = os.path.dirname(DB_PATH)
+    secret_path = os.path.join(secret_dir, ".secret_key")
+    try:
+        with open(secret_path, "r", encoding="ascii") as f:
+            saved = f.read().strip()
+            if len(saved) >= 32:
+                return saved
+    except (FileNotFoundError, OSError):
+        pass
+
+    new_key = secrets.token_urlsafe(48)
+    try:
+        os.makedirs(secret_dir, exist_ok=True)
+        with open(secret_path, "w", encoding="ascii") as f:
+            f.write(new_key)
+        try:
+            os.chmod(secret_path, 0o600)
+        except OSError:
+            pass  # Windows / overlay FS — best effort
+    except OSError:
+        pass  # in-memory fallback
+    return new_key
+
+
 def create_app() -> Flask:
     app = Flask(__name__, instance_path=APP_DIR)
-    app.secret_key = os.environ.get("SHOPPINGLIST_SECRET", "family-shopping-dev-key")
+    app.secret_key = _resolve_secret_key()
     app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES + 512 * 1024
     app.teardown_appcontext(close_db)
 
@@ -1537,7 +662,7 @@ def create_app() -> Flask:
                 m = re.search(r"\d+", s)
                 return int(m.group(0)) if m else 0
 
-            image_url = _safe(scraper.image, "")
+            image_url = _validate_image_url(_safe(scraper.image, ""))
             prep_time = _to_int_minutes(_safe(scraper.prep_time, 0))
             cook_time = _to_int_minutes(_safe(scraper.cook_time, 0))
             total_time = _to_int_minutes(_safe(scraper.total_time, 0))
@@ -1777,17 +902,11 @@ def create_app() -> Flask:
 
     @app.route("/recipes/<int:recipe_id>")
     def recipe_view(recipe_id: int):
-        db = get_db()
-        recipe = db.execute(
-            "SELECT id, name, description, servings, instructions, source_url, "
-            "image_url, prep_time, cook_time, total_time, category, notes, "
-            "is_favorite, rating, nutrition, yields_text, cuisine, author, "
-            "source_rating, keywords FROM recipe WHERE id = ?",
-            (recipe_id,),
-        ).fetchone()
+        recipe = _get_recipe(recipe_id)
         if recipe is None:
             flash("Recipe not found.", "error")
             return redirect(url_for("recipes_page"))
+        db = get_db()
         ingredients = db.execute(
             "SELECT id, name, quantity, unit, category, note "
             "FROM ingredient WHERE recipe_id = ? ORDER BY id",
@@ -1821,16 +940,13 @@ def create_app() -> Flask:
 
     @app.route("/recipes/<int:recipe_id>/edit", methods=["GET", "POST"])
     def recipe_edit(recipe_id: int):
-        db = get_db()
-        recipe = db.execute(
-            "SELECT id, name, description, servings, instructions, source_url, image_url, prep_time, cook_time, total_time, category, notes, is_favorite, rating, nutrition, yields_text, cuisine, author, source_rating, keywords FROM recipe WHERE id = ?",
-            (recipe_id,),
-        ).fetchone()
+        recipe = _get_recipe(recipe_id)
         if recipe is None:
             flash("Recipe not found.", "error")
             return redirect(url_for("recipes_page"))
         if request.method == "POST":
             return _save_recipe(recipe_id)
+        db = get_db()
         ings = db.execute(
             "SELECT id, name, quantity, unit, category, note "
             "FROM ingredient WHERE recipe_id = ? ORDER BY id",
@@ -1911,10 +1027,9 @@ def create_app() -> Flask:
             flash("Invalid date.", "error")
             return redirect(url_for("plan_page"))
 
-        try:
-            multiplier = max(0.1, float(multiplier_raw))
-        except ValueError:
-            multiplier = 1.0
+        multiplier = _parse_multiplier_field(
+            multiplier_raw, floor=0.1, cap=MAX_MULTIPLIER
+        )
 
         recipe_id = None
         if recipe_id_raw:
@@ -1983,16 +1098,247 @@ def create_app() -> Flask:
         )
         return redirect(url_for("index", _anchor="list"))
 
+    @app.route("/backup")
+    def backup_page():
+        db_size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        photo_count = 0
+        photo_bytes = 0
+        if os.path.isdir(UPLOAD_DIR):
+            for fname in os.listdir(UPLOAD_DIR):
+                full = os.path.join(UPLOAD_DIR, fname)
+                if os.path.isfile(full):
+                    photo_count += 1
+                    photo_bytes += os.path.getsize(full)
+        db_dir = os.path.dirname(DB_PATH)
+        snapshots = []
+        if os.path.isdir(db_dir):
+            for fname in sorted(os.listdir(db_dir), reverse=True):
+                if not fname.startswith("pre-restore-"):
+                    continue
+                if not (fname.endswith(".db") or fname.endswith(".zip")):
+                    continue
+                full = os.path.join(db_dir, fname)
+                try:
+                    snapshots.append({
+                        "name": fname,
+                        "size": os.path.getsize(full),
+                        "mtime": datetime.fromtimestamp(
+                            os.path.getmtime(full)
+                        ).strftime("%Y-%m-%d %H:%M"),
+                        "kind": "Full (DB + photos)" if fname.endswith(".zip")
+                                else "DB only (legacy)",
+                    })
+                except OSError:
+                    pass
+        return render_template(
+            "backup.html",
+            db_size=db_size,
+            photo_count=photo_count,
+            photo_bytes=photo_bytes,
+            snapshots=snapshots,
+        )
+
+    @app.get("/backup/download")
+    def backup_download():
+        # Build a ZIP of DB + every uploaded photo so a restore on a
+        # fresh Pi truly recreates the family's state.
+        fd, tmp_zip = tempfile.mkstemp(suffix=".zip", prefix="kasa-")
+        os.close(fd)
+        try:
+            _write_full_backup_zip(tmp_zip)
+        except Exception as exc:
+            try:
+                os.remove(tmp_zip)
+            except OSError:
+                pass
+            flash(f"Could not generate backup: {exc}", "error")
+            return redirect(url_for("backup_page"))
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        response = send_file(
+            tmp_zip,
+            as_attachment=True,
+            download_name=f"kasa-backup-{timestamp}.zip",
+            mimetype="application/zip",
+        )
+
+        @response.call_on_close
+        def _cleanup():
+            try:
+                os.remove(tmp_zip)
+            except OSError:
+                pass
+        return response
+
+    @app.post("/backup/restore")
+    def backup_restore():
+        file = request.files.get("backup")
+        confirm = request.form.get("confirm", "").strip().lower()
+        if confirm != "restore":
+            flash(
+                "Type the word RESTORE to confirm — this overwrites all "
+                "current recipes, lists, meal plans, and uploaded photos.",
+                "error",
+            )
+            return redirect(url_for("backup_page"))
+        if not file or not file.filename:
+            flash("Choose a backup file to restore.", "error")
+            return redirect(url_for("backup_page"))
+
+        db_dir = os.path.dirname(DB_PATH)
+        os.makedirs(db_dir, exist_ok=True)
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in (".zip", ".db"):
+            flash("Backup file must be .zip (full) or .db (legacy).", "error")
+            return redirect(url_for("backup_page"))
+
+        incoming = os.path.join(
+            db_dir, f"_incoming-{secrets.token_hex(8)}{ext}"
+        )
+        file.save(incoming)
+
+        # Always snapshot current state before touching anything.
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        pre_path = os.path.join(db_dir, f"pre-restore-{ts}.zip")
+        try:
+            _write_full_backup_zip(pre_path)
+        except Exception as exc:
+            try:
+                os.remove(incoming)
+            except OSError:
+                pass
+            flash(f"Couldn't snapshot current state; aborting: {exc}", "error")
+            return redirect(url_for("backup_page"))
+
+        # Branch on file type.
+        if ext == ".zip":
+            ok, msg = _restore_from_zip(incoming)
+        else:
+            ok, msg = _restore_from_db_only(incoming)
+
+        try:
+            os.remove(incoming)
+        except OSError:
+            pass
+
+        if ok:
+            flash(
+                f"{msg} Pre-restore snapshot saved as "
+                f"{os.path.basename(pre_path)}.",
+                "success",
+            )
+        else:
+            flash(msg, "error")
+        return redirect(url_for("backup_page"))
+
+    def _restore_from_zip(zip_path: str) -> tuple[bool, str]:
+        if not zipfile.is_zipfile(zip_path):
+            return False, "That .zip file is not a valid archive."
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    # Defend against ZIP slip — reject any path component
+                    # that escapes the temp dir.
+                    for member in zf.namelist():
+                        if member.startswith("/") or ".." in member.split("/"):
+                            return False, "Backup archive contains unsafe paths."
+                    zf.extractall(tmp)
+            except Exception as exc:
+                return False, f"Couldn't read backup archive: {exc}"
+            db_path = os.path.join(tmp, "shoppinglist.db")
+            if not os.path.isfile(db_path):
+                return False, "Backup archive doesn't contain shoppinglist.db."
+            if not _is_valid_kasa_db(db_path):
+                return False, "Backup DB is missing required tables."
+            try:
+                src = sqlite3.connect(db_path)
+                dst = sqlite3.connect(DB_PATH)
+                src.backup(dst)
+                dst.close()
+                src.close()
+            except Exception as exc:
+                return False, f"DB restore failed: {exc}"
+            # Replace uploads — wipe everything in UPLOAD_DIR, then copy
+            # whatever was in the ZIP's uploads/ folder.
+            os.makedirs(UPLOAD_DIR, exist_ok=True)
+            for fname in os.listdir(UPLOAD_DIR):
+                full = os.path.join(UPLOAD_DIR, fname)
+                if os.path.isfile(full):
+                    try:
+                        os.remove(full)
+                    except OSError:
+                        pass
+            uploads_src = os.path.join(tmp, "uploads")
+            photo_count = 0
+            if os.path.isdir(uploads_src):
+                for fname in os.listdir(uploads_src):
+                    full = os.path.join(uploads_src, fname)
+                    if os.path.isfile(full):
+                        shutil.copy2(full, os.path.join(UPLOAD_DIR, fname))
+                        photo_count += 1
+        return True, f"Restored DB and {photo_count} photo(s) from backup."
+
+    def _restore_from_db_only(db_path: str) -> tuple[bool, str]:
+        if not _is_valid_kasa_db(db_path):
+            return False, "That .db file is not a Kasa backup."
+        try:
+            src = sqlite3.connect(db_path)
+            dst = sqlite3.connect(DB_PATH)
+            src.backup(dst)
+            dst.close()
+            src.close()
+        except Exception as exc:
+            return False, f"Restore failed: {exc}"
+        return True, (
+            "Restored DB only — uploaded photos are unchanged "
+            "(use a .zip backup to also restore photos)."
+        )
+
+    _SNAPSHOT_NAME_RE = re.compile(
+        r"pre-restore-[0-9]{8}-[0-9]{6}\.(?:db|zip)"
+    )
+
+    @app.get("/backup/snapshot/<name>")
+    def backup_snapshot_download(name: str):
+        # Only allow filenames matching the pre-restore-*.{db,zip}
+        # convention so an attacker can't path-traverse.
+        if not _SNAPSHOT_NAME_RE.fullmatch(name):
+            return ("Not found", 404)
+        full = os.path.join(os.path.dirname(DB_PATH), name)
+        if not os.path.isfile(full):
+            return ("Not found", 404)
+        mime = "application/zip" if name.endswith(".zip") else "application/octet-stream"
+        return send_file(
+            full,
+            as_attachment=True,
+            download_name=name,
+            mimetype=mime,
+        )
+
+    @app.post("/backup/snapshot/<name>/delete")
+    def backup_snapshot_delete(name: str):
+        if not _SNAPSHOT_NAME_RE.fullmatch(name):
+            flash("Invalid snapshot name.", "error")
+            return redirect(url_for("backup_page"))
+        full = os.path.join(os.path.dirname(DB_PATH), name)
+        if os.path.isfile(full):
+            try:
+                os.remove(full)
+                flash(f"Deleted {name}.", "success")
+            except OSError as exc:
+                flash(f"Could not delete: {exc}", "error")
+        return redirect(url_for("backup_page"))
+
     @app.route("/list/add-recipe", methods=["POST"])
     def list_add_recipe():
         recipe_id = request.form.get("recipe_id", type=int)
-        multiplier_raw = request.form.get("multiplier", "1").strip() or "1"
+        multiplier_raw = request.form.get("multiplier", "1")
         added_by = request.form.get("added_by", "").strip()
-        try:
-            multiplier = max(1, int(float(multiplier_raw)))
-        except ValueError:
-            flash("Multiplier must be a whole number ≥ 1.", "error")
-            return redirect(url_for("index"))
+        multiplier = int(
+            _parse_multiplier_field(
+                multiplier_raw, allow_float=False, floor=1, cap=MAX_MULTIPLIER
+            )
+        )
         db = get_db()
         recipe = db.execute(
             "SELECT name FROM recipe WHERE id = ?", (recipe_id,)
@@ -2023,10 +1369,14 @@ def create_app() -> Flask:
         if not name:
             flash("Item name is required.", "error")
             return redirect(url_for("index", _anchor="list"))
-        try:
-            qty = max(1, int(float(request.form.get("quantity", "1") or 1)))
-        except ValueError:
-            qty = 1
+        qty = int(
+            _parse_multiplier_field(
+                request.form.get("quantity"),
+                allow_float=False,
+                floor=1,
+                cap=MAX_QUANTITY,
+            )
+        )
         unit = request.form.get("unit", "").strip()
         # Aisle is auto-classified from the item name. Falls back to "Other"
         # for things the keyword classifier doesn't recognize.
@@ -2093,7 +1443,7 @@ def create_app() -> Flask:
         description = request.form.get("description", "").strip()
         instructions = request.form.get("instructions", "").strip()
         source_url = request.form.get("source_url", "").strip()
-        image_url = request.form.get("image_url", "").strip()
+        image_url = _validate_image_url(request.form.get("image_url", ""))
         # An uploaded file (e.g., taken on phone) takes precedence over a
         # pasted URL, since the user explicitly chose a new image.
         try:
@@ -2108,16 +1458,11 @@ def create_app() -> Flask:
         rating_raw = request.form.get("rating", "0").strip() or "0"
         servings_raw = request.form.get("servings", "4").strip() or "4"
 
-        def _int_field(name: str) -> int:
-            raw = request.form.get(name, "0").strip() or "0"
-            try:
-                return max(0, int(float(raw)))
-            except ValueError:
-                return 0
-
-        prep_time = _int_field("prep_time")
-        cook_time = _int_field("cook_time")
-        total_time = _int_field("total_time") or (prep_time + cook_time)
+        prep_time = _int_field(request.form, "prep_time")
+        cook_time = _int_field(request.form, "cook_time")
+        total_time = _int_field(request.form, "total_time") or (
+            prep_time + cook_time
+        )
         try:
             rating = max(0, min(5, int(float(rating_raw))))
         except ValueError:

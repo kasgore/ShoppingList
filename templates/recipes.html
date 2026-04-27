@@ -54,12 +54,14 @@
     <article class="recipe-card">
       {% if r.recipe.image_url %}
         <a href="{{ url_for('recipe_view', recipe_id=r.recipe.id) }}" class="recipe-thumb-link">
-          <img class="recipe-thumb" src="{{ r.recipe.image_url }}" alt="" loading="lazy">
+          <img class="recipe-thumb" src="{{ r.recipe.image_url }}"
+               alt="Photo of {{ r.recipe.name }}" loading="lazy">
         </a>
       {% else %}
         <a href="{{ url_for('recipe_edit', recipe_id=r.recipe.id) }}#image_file"
            class="recipe-thumb-link" title="Add a photo">
-          <img class="recipe-thumb is-stock" src="{{ recipe_image(r.recipe) }}" alt="" loading="lazy">
+          <img class="recipe-thumb is-stock" src="{{ recipe_image(r.recipe) }}"
+               alt="Add a photo for {{ r.recipe.name }}" loading="lazy">
         </a>
       {% endif %}
       <a href="{{ url_for('recipe_view', recipe_id=r.recipe.id) }}" class="recipe-card-link">

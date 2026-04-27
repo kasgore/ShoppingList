@@ -55,11 +55,13 @@
   </header>
 
   {% if recipe.image_url %}
-    <img class="recipe-hero" src="{{ recipe.image_url }}" alt="">
+    <img class="recipe-hero" src="{{ recipe.image_url }}"
+         alt="Photo of {{ recipe.name }}">
   {% else %}
     <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}#image_file"
        class="recipe-hero-link" title="Add a photo">
-      <img class="recipe-hero is-stock" src="{{ recipe_image(recipe) }}" alt="">
+      <img class="recipe-hero is-stock" src="{{ recipe_image(recipe) }}"
+           alt="Add a photo for {{ recipe.name }}">
     </a>
   {% endif %}
 

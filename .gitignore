@@ -5,6 +5,9 @@ __pycache__/
 venv/
 shoppinglist.db
 static/uploads/
+.secret_key
+pre-restore-*.db
+pre-restore-*.zip
 
 # But DO commit anything explicitly placed under seed_data/ — it's
 # the deploy-time snapshot that gets baked into the Docker image.

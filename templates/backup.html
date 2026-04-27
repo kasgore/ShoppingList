@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Backup · Kasa{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h2>Backup</h2>
+  <p class="muted">
+    Downloads a single ZIP containing every recipe, ingredient, shopping list
+    state, meal plan, and uploaded photo. Restoring this file on any Kasa
+    instance reproduces the family's full state.
+  </p>
+  <ul class="muted small-note">
+    <li>Database (recipes + lists + plans): {{ '%.1f' % (db_size / 1024 / 1024) }} MB</li>
+    <li>Uploaded photos: {{ photo_count }}
+        ({{ '%.1f' % (photo_bytes / 1024 / 1024) }} MB)</li>
+  </ul>
+  <p>
+    <a href="{{ url_for('backup_download') }}" class="button primary">
+      Download backup (.zip)
+    </a>
+  </p>
+  <p class="muted small-note">
+    Tip: save the ZIP somewhere off the Pi (Dropbox, Google Drive, an external
+    drive, etc.) so a hardware failure can't take both the live data and the
+    backup at once.
+  </p>
+</section>
+
+<section class="card">
+  <h2>Restore from backup</h2>
+  <p class="muted">
+    Replaces <strong>all</strong> recipes, ingredients, lists, meal plans, and
+    photos with the contents of an uploaded backup. Your current state is
+    snapshotted first (see below) so a bad restore is reversible.
+  </p>
+  <form action="{{ url_for('backup_restore') }}" method="post"
+        enctype="multipart/form-data" class="stack"
+        onsubmit="return confirm('Replace everything in this Kasa with the uploaded backup?');">
+    <label>
+      <span>Backup file (.zip preferred, .db accepted for legacy)</span>
+      <input type="file" name="backup" accept=".zip,.db" required>
+    </label>
+    <label>
+      <span>Type <code>RESTORE</code> to confirm</span>
+      <input type="text" name="confirm" required pattern="(?i)RESTORE"
+             placeholder="RESTORE">
+    </label>
+    <button type="submit" class="button danger">Restore from this file</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Pre-restore snapshots</h2>
+  {% if snapshots %}
+    <p class="muted">
+      Each restore takes a full snapshot of the previous state first. Download
+      one to roll back, or delete to free up disk.
+    </p>
+    <ul class="chip-list">
+      {% for s in snapshots %}
+        <li>
+          <span>
+            <strong>{{ s.mtime }}</strong>
+            <em class="muted">— {{ s.kind }} · {{ '%.1f' % (s.size / 1024 / 1024) }} MB</em>
+          </span>
+          <span class="actions">
+            <a href="{{ url_for('backup_snapshot_download', name=s.name) }}"
+               class="button">Download</a>
+            <form action="{{ url_for('backup_snapshot_delete', name=s.name) }}"
+                  method="post" class="inline"
+                  onsubmit="return confirm('Delete {{ s.name }}?');">
+              <button class="button danger">Delete</button>
+            </form>
+          </span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">No pre-restore snapshots yet — they're created automatically
+      whenever you do a Restore.</p>
+  {% endif %}
+</section>
+{% endblock %}
