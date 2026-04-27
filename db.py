@@ -117,6 +117,14 @@ def get_db() -> sqlite3.Connection:
         conn = sqlite3.connect(DB_PATH, timeout=5.0)
         conn.row_factory = sqlite3.Row
         _apply_connection_pragmas(conn)
+        # Best-effort load of sqlite-vec for semantic search. If the
+        # extension or fastembed isn't installed/available, vec queries
+        # fall back to empty and keyword search keeps working.
+        try:
+            import embedding as _embedding
+            _embedding.setup_extension(conn)
+        except ImportError:
+            pass
         g.db = conn
     return g.db
 
@@ -188,6 +196,43 @@ def init_db() -> None:
                         (guessed, row[0]),
                     )
         conn.commit()
+
+        # Best-effort: create the vec0 virtual table for semantic search
+        # and backfill embeddings for any recipes that don't have one.
+        # Skipped silently if fastembed/sqlite-vec aren't installed —
+        # keyword search continues working in that case.
+        try:
+            import embedding as _embedding
+        except ImportError:
+            return
+        if not _embedding.init_schema(conn):
+            return
+        if not _embedding.is_available():
+            return
+        # Use a row factory so build_recipe_text can do row["col"] lookup.
+        conn.row_factory = sqlite3.Row
+        existing_ids = {
+            r[0] for r in conn.execute(
+                "SELECT recipe_id FROM recipe_embedding"
+            ).fetchall()
+        }
+        all_ids = {
+            r[0] for r in conn.execute("SELECT id FROM recipe").fetchall()
+        }
+        missing = sorted(all_ids - existing_ids)
+        for rid in missing:
+            row = conn.execute(
+                "SELECT id, name, description, category, cuisine, keywords "
+                "FROM recipe WHERE id = ?",
+                (rid,),
+            ).fetchone()
+            ings = conn.execute(
+                "SELECT name FROM ingredient WHERE recipe_id = ?", (rid,)
+            ).fetchall()
+            text = _embedding.build_recipe_text(row, ings)
+            _embedding.upsert_recipe_embedding(conn, rid, text)
+        if missing:
+            conn.commit()
 
 
 def seed_recipes(conn: sqlite3.Connection) -> None:

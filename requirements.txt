@@ -2,3 +2,8 @@ Flask>=3.0
 recipe-scrapers>=15.0
 pytesseract>=0.3.10
 pillow-heif>=0.16
+# Semantic search: fastembed (ONNX runtime) + sqlite-vec (C extension).
+# Both are optional at runtime — the app falls back to keyword-only
+# search if either is missing or fails to load.
+fastembed>=0.4
+sqlite-vec>=0.1.6

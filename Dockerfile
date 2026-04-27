@@ -17,6 +17,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn==21.2.0 Pillow
 
+# Bake the MiniLM embedding model into the image so the container doesn't
+# have to download ~22 MB on first request. Cache lives at /app/.fastembed
+# so it gets chowned to the `app` user along with the rest of /app.
+ENV FASTEMBED_CACHE_PATH=/app/.fastembed
+RUN mkdir -p /app/.fastembed \
+ && python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2'); print('MiniLM cached')" \
+ || echo "MiniLM cache failed — semantic search will degrade to no-op at runtime"
+
 # Copy the rest of the app.
 COPY . .
 

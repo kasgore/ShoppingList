@@ -38,6 +38,12 @@
       <a href="{{ url_for('recipes_page') }}" class="button">Clear</a>
     {% endif %}
   </form>
+  {% if q and semantic_extra %}
+    <p class="muted small-note">
+      Found {{ semantic_extra }} additional smart match{{ '' if semantic_extra == 1 else 'es' }}
+      below the keyword hits.
+    </p>
+  {% endif %}
 
   {% if not recipes %}
     <p class="empty">

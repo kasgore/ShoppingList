@@ -356,6 +356,33 @@ def _get_recipe(recipe_id: int):
     ).fetchone()
 
 
+def _refresh_recipe_embedding(db, recipe_id: int) -> None:
+    """Recompute and upsert the semantic embedding for a recipe.
+
+    Best-effort — silently skipped if fastembed/sqlite-vec aren't
+    installed or aren't usable on this build. Called from the recipe
+    save handler and the URL/photo import flows.
+    """
+    try:
+        import embedding as _embedding
+    except ImportError:
+        return
+    if not _embedding.is_available():
+        return
+    row = db.execute(
+        "SELECT id, name, description, category, cuisine, keywords "
+        "FROM recipe WHERE id = ?",
+        (recipe_id,),
+    ).fetchone()
+    if row is None:
+        return
+    ings = db.execute(
+        "SELECT name FROM ingredient WHERE recipe_id = ?", (recipe_id,)
+    ).fetchall()
+    text = _embedding.build_recipe_text(row, ings)
+    _embedding.upsert_recipe_embedding(db, recipe_id, text)
+
+
 def _validate_image_url(url: str) -> str:
     """Allow only http(s) URLs or our own /static/uploads/ paths.
 
@@ -503,6 +530,7 @@ def create_app() -> Flask:
         q = request.args.get("q", "").strip()
         cat = request.args.get("cat", "").strip()
         favs = request.args.get("favs") == "1"
+        # Keyword search via LIKE — exact-match-ish, fast, deterministic.
         sql = (
             "SELECT id, name, description, servings, instructions, source_url, "
             "image_url, prep_time, cook_time, total_time, category, notes, "
@@ -519,7 +547,48 @@ def create_app() -> Flask:
         if favs:
             sql += " AND is_favorite = 1"
         sql += " ORDER BY is_favorite DESC, name"
-        rows = db.execute(sql, params).fetchall()
+        rows = list(db.execute(sql, params).fetchall())
+
+        # Semantic supplement: when there's a query, also run a vec search
+        # and append matches that the keyword pass missed. Best-effort —
+        # silently no-ops if fastembed/sqlite-vec aren't installed.
+        semantic_extra = 0
+        if q:
+            try:
+                import embedding as _embedding
+                if _embedding.is_available():
+                    keyword_ids = {r["id"] for r in rows}
+                    semantic_ids = _embedding.search(db, q, limit=15)
+                    extra_ids = [
+                        sid for sid in semantic_ids if sid not in keyword_ids
+                    ]
+                    if extra_ids:
+                        placeholders = ",".join("?" for _ in extra_ids)
+                        ext_sql = (
+                            "SELECT id, name, description, servings, "
+                            "instructions, source_url, image_url, prep_time, "
+                            "cook_time, total_time, category, notes, "
+                            "is_favorite, rating FROM recipe "
+                            f"WHERE id IN ({placeholders})"
+                        )
+                        ext_params = list(extra_ids)
+                        if cat:
+                            ext_sql += " AND category = ?"
+                            ext_params.append(cat)
+                        if favs:
+                            ext_sql += " AND is_favorite = 1"
+                        ext_rows = db.execute(ext_sql, ext_params).fetchall()
+                        # Re-order extras by the semantic ranking that
+                        # produced them.
+                        row_by_id = {r["id"]: r for r in ext_rows}
+                        ordered_extras = [
+                            row_by_id[sid] for sid in extra_ids
+                            if sid in row_by_id
+                        ]
+                        rows.extend(ordered_extras)
+                        semantic_extra = len(ordered_extras)
+            except ImportError:
+                pass
 
         all_categories = [
             row["category"]
@@ -544,6 +613,7 @@ def create_app() -> Flask:
             recipe_categories=RECIPE_CATEGORIES,
             existing_categories=all_categories,
             q=q, cat=cat, favs=favs,
+            semantic_extra=semantic_extra,
         )
 
     @app.route("/recipes/<int:recipe_id>/rate", methods=["POST"])
@@ -773,6 +843,8 @@ def create_app() -> Flask:
                 ),
             )
         db.commit()
+        _refresh_recipe_embedding(db, recipe_id)
+        db.commit()
         flash(
             f"Imported \"{title}\" — review categories and units, then save.",
             "success",
@@ -885,6 +957,8 @@ def create_app() -> Flask:
                     parsed["note"],
                 ),
             )
+        db.commit()
+        _refresh_recipe_embedding(db, recipe_id)
         db.commit()
         if not ing_lines and not instructions.strip():
             flash(
@@ -1533,6 +1607,8 @@ def create_app() -> Flask:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (recipe_id, n, q, u, c, note),
             )
+        db.commit()
+        _refresh_recipe_embedding(db, recipe_id)
         db.commit()
         flash(f"Saved recipe: {name}.", "success")
         return redirect(url_for("recipes_page"))
