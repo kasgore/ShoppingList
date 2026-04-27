@@ -54,9 +54,12 @@ ENV SHOPPINGLIST_DB=/data/shoppinglist.db \
 
 EXPOSE 80
 
-# 2 workers is plenty for family LAN traffic; bump if you ever need more.
+# Single worker + threads so SSE subscribers share one in-memory queue
+# (multi-worker would only fan out within the worker that received the
+# write). 8 threads handle the SSE long-poll connections plus normal
+# request traffic comfortably for family-scale use.
 # Binding to port 80 as a non-root user requires the
 # `net.ipv4.ip_unprivileged_port_start=0` sysctl, set in docker-compose.yml.
 CMD ["gunicorn", "--bind", "0.0.0.0:80", \
-     "--workers", "2", "--threads", "4", \
+     "--workers", "1", "--threads", "8", \
      "--access-logfile", "-", "app:app"]

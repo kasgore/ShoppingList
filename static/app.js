@@ -7,6 +7,38 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+// Real-time list sync: open an EventSource on the home page so when one
+// family member checks an item off (or adds one) every other phone
+// updates within a second. Reload is debounced + skipped while the user
+// is actively typing or the page is hidden, to avoid clobbering their work.
+(function setupListSync() {
+  if (!("EventSource" in window)) return;
+  // Only useful on the shopping list page.
+  if (location.pathname !== "/" && location.pathname !== "/index") return;
+
+  let reloadTimer = null;
+  let lastReload = Date.now();
+  const MIN_RELOAD_INTERVAL = 1500;
+
+  const sse = new EventSource("/events");
+  sse.addEventListener("list_changed", () => {
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = setTimeout(() => {
+      const focused = document.activeElement;
+      const typing = focused && focused.matches("input, textarea, select");
+      if (typing) return;            // don't clobber a form-in-progress
+      if (document.hidden) return;   // tab hidden; rely on next event
+      if (Date.now() - lastReload < MIN_RELOAD_INTERVAL) return;
+      lastReload = Date.now();
+      location.reload();
+    }, 600);  // brief debounce so a flurry of edits collapses to one reload
+  });
+  sse.onerror = () => {
+    // Browser auto-reconnects EventSource; nothing to do beyond logging.
+    // (Failure here just means real-time off; user can pull-to-refresh.)
+  };
+})();
+
 // When the recipe edit page loads with #image_file in the URL (because the
 // user tapped the "Add a photo" stock thumbnail), open the file picker.
 window.addEventListener("DOMContentLoaded", () => {

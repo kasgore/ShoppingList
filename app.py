@@ -12,8 +12,12 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+import queue
+import threading
+
 from flask import (
     Flask,
+    Response,
     flash,
     g,
     jsonify,
@@ -356,6 +360,35 @@ def _get_recipe(recipe_id: int):
     ).fetchone()
 
 
+# ---------------------------------------------------------------------------
+# Server-Sent Events: real-time list sync across family devices
+# ---------------------------------------------------------------------------
+#
+# In-memory pub/sub. Each connected client owns a Queue; mutating routes
+# call _broadcast(...) which fans out to every queue.
+#
+# Caveat: subscribers are per-process. Run gunicorn with a single worker
+# (threaded) so all clients share one subscriber pool — see Dockerfile.
+# Multi-worker still functionally works (cross-worker events just won't
+# arrive), so degradation is graceful.
+
+_sse_subscribers: "set[queue.Queue]" = set()
+_sse_lock = threading.Lock()
+
+
+def _broadcast(event_type: str, data: str = "1") -> None:
+    """Push an event to every subscriber. Best-effort — full queues are
+    skipped rather than blocked on, because a slow client must not stall
+    a write request."""
+    with _sse_lock:
+        subscribers = list(_sse_subscribers)
+    for q in subscribers:
+        try:
+            q.put_nowait((event_type, data))
+        except queue.Full:
+            pass
+
+
 def _refresh_recipe_embedding(db, recipe_id: int) -> None:
     """Recompute and upsert the semantic embedding for a recipe.
 
@@ -497,6 +530,41 @@ def create_app() -> Flask:
         resp.headers["Service-Worker-Allowed"] = "/"
         resp.headers["Cache-Control"] = "no-cache"
         return resp
+
+    @app.route("/events")
+    def events():
+        """Server-Sent Events stream for cross-device list sync.
+
+        One Queue per connected client; mutating routes call
+        `_broadcast("list_changed")` which fans out to every queue.
+        Heartbeats every 15s keep the connection alive through any
+        intervening proxies. Disconnects clean up the queue via
+        `try/finally` in the generator.
+        """
+        def gen():
+            q: queue.Queue = queue.Queue(maxsize=20)
+            with _sse_lock:
+                _sse_subscribers.add(q)
+            try:
+                yield ": connected\n\n"
+                while True:
+                    try:
+                        event_type, data = q.get(timeout=15)
+                    except queue.Empty:
+                        # Comment-only line keeps the connection warm
+                        # without firing a client-side event.
+                        yield ": heartbeat\n\n"
+                        continue
+                    yield f"event: {event_type}\ndata: {data}\n\n"
+            finally:
+                with _sse_lock:
+                    _sse_subscribers.discard(q)
+
+        response = Response(gen(), mimetype="text/event-stream")
+        # Defeat reverse-proxy buffering for SSE.
+        response.headers["Cache-Control"] = "no-cache, no-transform"
+        response.headers["X-Accel-Buffering"] = "no"
+        return response
 
     # ---- Pages ----------------------------------------------------------
 
@@ -1426,6 +1494,7 @@ def create_app() -> Flask:
             (recipe_id, multiplier, added_by),
         )
         db.commit()
+        _broadcast("list_changed")
         flash(f"Added {recipe['name']} to the shopping list.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -1434,6 +1503,7 @@ def create_app() -> Flask:
         db = get_db()
         db.execute("DELETE FROM list_recipe WHERE id = ?", (list_recipe_id,))
         db.commit()
+        _broadcast("list_changed")
         flash("Recipe removed from list.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -1464,6 +1534,7 @@ def create_app() -> Flask:
             (name, qty, unit, category, note, added_by),
         )
         db.commit()
+        _broadcast("list_changed")
         flash(f"Added {name} to the shopping list.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -1473,6 +1544,7 @@ def create_app() -> Flask:
         db.execute("DELETE FROM adhoc_item WHERE id = ?", (adhoc_id,))
         db.execute("DELETE FROM checked_item WHERE key = ?", (f"adhoc::{adhoc_id}",))
         db.commit()
+        _broadcast("list_changed")
         flash("Item removed.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -1492,6 +1564,7 @@ def create_app() -> Flask:
         else:
             db.execute("DELETE FROM checked_item WHERE key = ?", (key,))
         db.commit()
+        _broadcast("list_changed")
         return jsonify({"ok": True})
 
     @app.route("/list/clear", methods=["POST"])
@@ -1507,6 +1580,7 @@ def create_app() -> Flask:
         else:
             db.execute("DELETE FROM checked_item")
         db.commit()
+        _broadcast("list_changed")
         flash("Shopping list cleared.", "success")
         return redirect(url_for("index"))
 
