@@ -202,6 +202,8 @@ def parse_ingredient(line: str) -> dict:
             if candidate in UNIT_ALIASES:
                 unit = UNIT_ALIASES[candidate]
                 rest = parts[1] if len(parts) > 1 else ""
+        # Drop a leading "of " that follows the unit ("1 cup of flour").
+        rest = re.sub(r"^of\s+", "", rest, flags=re.I)
 
     name = rest.strip()
     if not name:
