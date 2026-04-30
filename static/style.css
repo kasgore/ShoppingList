@@ -742,6 +742,18 @@ code {
   .card { box-shadow: none; border: none; }
 }
 
+/* Warning callout used on the Backup page when remote-URL images
+ * weren't baked into local uploads yet. */
+.warn-box {
+  margin: 14px 0;
+  padding: 12px 14px;
+  background: #fff8e1;
+  border-left: 4px solid #f9a825;
+  border-radius: 4px;
+}
+.warn-box p { margin: 0 0 8px; }
+.warn-box p:last-child { margin-bottom: 0; }
+
 /* Cook Mode — full-screen step-by-step recipe view */
 .cook-mode {
   min-height: 100vh;

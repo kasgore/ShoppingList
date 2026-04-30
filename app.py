@@ -787,6 +787,49 @@ def _rotate_pre_restore_snapshots(keep: int = 5) -> None:
             pass
 
 
+def _count_remote_image_recipes(db) -> int:
+    """How many recipes have an image_url that points OFF the Pi.
+
+    Recipes imported before Stage 9 (image-baking) still have remote
+    URLs and their photos won't appear in any /backup ZIP because we
+    only include files under /static/uploads/. Surfacing the count
+    on the backup page lets the user one-click "rebake" them.
+    """
+    row = db.execute(
+        "SELECT COUNT(*) FROM recipe "
+        "WHERE image_url != '' "
+        "AND (image_url LIKE 'http://%' OR image_url LIKE 'https://%')"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def _rebake_remote_recipe_images(db) -> tuple[int, int]:
+    """Fetch every remote-URL recipe image and replace it with a local
+    /static/uploads/ path. Returns (succeeded, failed). Best-effort —
+    failures (network, image format mismatch, host blocking) leave the
+    recipe's original remote URL in place.
+    """
+    rows = db.execute(
+        "SELECT id, image_url FROM recipe "
+        "WHERE image_url LIKE 'http://%' OR image_url LIKE 'https://%'"
+    ).fetchall()
+    succeeded = 0
+    failed = 0
+    for row in rows:
+        local = _fetch_remote_image(row["image_url"])
+        if local:
+            db.execute(
+                "UPDATE recipe SET image_url = ? WHERE id = ?",
+                (local, row["id"]),
+            )
+            succeeded += 1
+        else:
+            failed += 1
+    if succeeded:
+        db.commit()
+    return succeeded, failed
+
+
 def _scan_orphan_images() -> list[str]:
     """Return basenames in UPLOAD_DIR that no recipe.image_url references."""
     if not os.path.isdir(UPLOAD_DIR):
@@ -1088,7 +1131,12 @@ def _resolve_secret_key() -> str:
 def create_app() -> Flask:
     app = Flask(__name__, instance_path=APP_DIR)
     app.secret_key = _resolve_secret_key()
-    app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES + 512 * 1024
+    # Generous upload cap so a full backup ZIP (DB + every uploaded photo)
+    # can come back in via /backup/restore. Per-image photos are still
+    # bounded to MAX_UPLOAD_BYTES (8 MB) by _save_uploaded_image, and the
+    # recipe-image fetcher caps at the same. The global limit only opens
+    # the door for legitimately-large backup uploads.
+    app.config["MAX_CONTENT_LENGTH"] = 256 * 1024 * 1024  # 256 MB
     app.teardown_appcontext(close_db)
 
     # ---- PWA assets ----------------------------------------------------
@@ -1979,6 +2027,7 @@ def create_app() -> Flask:
                 pass
         auto_backups = _list_auto_backups()
         auto_backup_dir = _auto_backup_dir()
+        remote_image_count = _count_remote_image_recipes(get_db())
         return render_template(
             "backup.html",
             db_size=db_size,
@@ -1990,7 +2039,31 @@ def create_app() -> Flask:
             auto_backups=auto_backups,
             auto_backup_dir=auto_backup_dir,
             backup_enabled=os.environ.get("BACKUP_ENABLED", "1") != "0",
+            remote_image_count=remote_image_count,
         )
+
+    @app.post("/backup/rebake-images")
+    def backup_rebake_images():
+        """Pull every remote recipe image down to /static/uploads/ so
+        they actually land in the backup ZIP. One-shot migration for
+        recipes imported before Stage 9 added the image-baker."""
+        succeeded, failed = _rebake_remote_recipe_images(get_db())
+        if succeeded == 0 and failed == 0:
+            flash("No remote-URL recipe images to rebake.", "success")
+        elif failed == 0:
+            flash(
+                f"Baked {succeeded} remote recipe image"
+                f"{'' if succeeded == 1 else 's'} into local uploads.",
+                "success",
+            )
+        else:
+            flash(
+                f"Baked {succeeded} image(s); {failed} failed (host blocked, "
+                "image moved, or network error). The failed ones still have "
+                "their original URL — try again later or replace manually.",
+                "error",
+            )
+        return redirect(url_for("backup_page"))
 
     @app.post("/backup/auto/run-now")
     def backup_auto_run_now():
@@ -2143,6 +2216,21 @@ def create_app() -> Flask:
             pass
 
         if ok:
+            # Re-run schema migrations so an older backup (made before
+            # newer tables/columns existed) lands in a state the running
+            # app can actually query. init_db is idempotent — CREATE
+            # TABLE IF NOT EXISTS + ALTER on missing columns + classifier
+            # version check. Cheap to call.
+            try:
+                init_db()
+            except Exception as exc:
+                # Don't fail the restore if migration hits an edge case;
+                # the next container restart will run init_db again.
+                print(
+                    f"[restore] post-restore init_db failed (will retry "
+                    f"on next boot): {exc}",
+                    flush=True,
+                )
             flash(
                 f"{msg} Pre-restore snapshot saved as "
                 f"{os.path.basename(pre_path)}.",

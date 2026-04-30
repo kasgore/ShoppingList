@@ -14,6 +14,26 @@
     <li>Uploaded photos: {{ photo_count }}
         ({{ '%.1f' % (photo_bytes / 1024 / 1024) }} MB)</li>
   </ul>
+  {% if remote_image_count and remote_image_count > 0 %}
+    <div class="warn-box">
+      <p>
+        <strong>{{ remote_image_count }} recipe{{ '' if remote_image_count == 1 else 's' }}
+        still link to remote photos</strong> hosted on the source website.
+        These photos will <em>not</em> be in the downloaded backup ZIP, and
+        will break if the source site goes down or removes the image.
+      </p>
+      <form action="{{ url_for('backup_rebake_images') }}" method="post" class="inline">
+        <button type="submit" class="button primary">
+          Bake remote photos into local uploads
+        </button>
+      </form>
+      <p class="muted small-note">
+        One-shot migration: fetches each remote image, stores it under
+        <code>/static/uploads/</code>, and updates the recipe to point
+        at the local copy. Failed fetches leave the original URL intact.
+      </p>
+    </div>
+  {% endif %}
   <p>
     <a href="{{ url_for('backup_download') }}" class="button primary">
       Download backup (.zip)
