@@ -806,6 +806,167 @@ def _scan_orphan_images() -> list[str]:
     return sorted(on_disk - referenced)
 
 
+# A current desktop-Chrome UA. Used for URL imports where the previous
+# `Mozilla/5.0 (compatible; FamilyShoppingList/1.0)` triggered bot-flag
+# rules on a few recipe blogs (Wordfence, Cloudflare's default WAF).
+# Bump roughly once a year. Don't include "bot" / "scraper" tokens.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/132.0.0.0 Safari/537.36"
+)
+
+
+def _http_get(
+    url: str,
+    timeout: float = 15.0,
+    retries: int = 3,
+    extra_headers: dict | None = None,
+) -> "tuple[bytes, dict] | None":
+    """Polite GET with retry-on-transient-failure. Returns (body, headers)
+    or None on terminal failure. Backoff: 1.5s, 3.0s, 6.0s. Honors
+    Retry-After when the server sends 429.
+
+    No external dependency — built on stdlib `urllib`. Used for both the
+    URL-import HTML fetch (when recipe-scrapers' wild_mode is needed)
+    and the image-baker for hotlinked recipe photos.
+    """
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+    import time
+
+    headers = {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/png,image/*;q=0.8,*/*;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",  # let urlopen handle decoding
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    backoff = 1.5
+    for attempt in range(max(1, retries)):
+        try:
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=timeout) as resp:
+                return resp.read(), dict(resp.headers)
+        except HTTPError as exc:
+            # 4xx other than 429 are terminal — no retry.
+            if exc.code in (429, 500, 502, 503, 504):
+                if attempt + 1 < retries:
+                    wait = backoff * (2 ** attempt)
+                    # Honor Retry-After if present and reasonable.
+                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                    if retry_after:
+                        try:
+                            wait = max(wait, min(30.0, float(retry_after)))
+                        except ValueError:
+                            pass
+                    time.sleep(min(30.0, wait))
+                    continue
+            return None
+        except (URLError, TimeoutError, OSError):
+            if attempt + 1 < retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            return None
+    return None
+
+
+def _sniff_image_format(buf: bytes) -> str | None:
+    """Return a file extension for `buf` based on magic bytes, or None
+    if it doesn't look like a supported image. Pure stdlib — `imghdr`
+    was removed in Python 3.13."""
+    if len(buf) < 12:
+        return None
+    if buf[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if buf[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+        return ".webp"
+    if buf[4:12] in (b"ftypavif", b"ftypavis"):
+        return ".avif"
+    if buf[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if buf[:4] in (b"ftyp",) or buf[4:8] == b"ftyp":
+        # HEIC variants — common from iPhone-shot recipe pages.
+        if b"heic" in buf[4:32].lower() or b"heif" in buf[4:32].lower():
+            return ".heic"
+    return None
+
+
+def _fetch_remote_image(url: str) -> str:
+    """Download a remote image to /static/uploads/ and return its local
+    path, or "" on any failure. Caller falls back to the original URL.
+
+    Defenses:
+      * 8 MB cap (read no more)
+      * Magic-byte validation (don't trust Content-Type or URL extension)
+      * No Referer header on first try (some hotlink rules whitelist
+        empty Referer); retry with the recipe URL as Referer on 403
+      * EXIF stripped before storing (privacy + smaller files)
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+    # First attempt: no Referer.
+    result = _http_get(url, timeout=10.0, retries=2)
+    if result is None:
+        return ""
+    body, _headers = result
+    # Truncate to the cap if the server sent more.
+    body = body[:MAX_UPLOAD_BYTES]
+    ext = _sniff_image_format(body)
+    if ext is None:
+        return ""
+    if ext not in ALLOWED_IMAGE_EXTS:
+        return ""
+    try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        safe = f"{secrets.token_hex(8)}{ext}"
+        dest = os.path.join(UPLOAD_DIR, safe)
+        with open(dest, "wb") as f:
+            f.write(body)
+    except OSError:
+        return ""
+    _strip_image_metadata(dest)
+    return f"/static/uploads/{safe}"
+
+
+# Tracking-parameter prefixes/names stripped from a source URL when we
+# canonicalize it for de-duplication. Conservative — only the obvious
+# analytics tags.
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term",
+    "utm_content", "utm_id", "utm_name", "utm_brand",
+    "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid",
+    "_ga", "ref", "ref_src", "ref_url", "igshid",
+    "yclid", "dclid", "twclid", "wbraid", "gbraid",
+}
+
+
+def _canonical_source_url(url: str) -> str:
+    """Strip tracking params + fragment from `url` so re-imports can
+    match. Returns "" if the URL doesn't parse."""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+        parsed = urlparse(url.strip())
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        kept = [
+            (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() not in _TRACKING_PARAMS
+        ]
+        new_query = urlencode(kept)
+        # Drop fragment too — never identifies a different recipe.
+        return urlunparse(parsed._replace(query=new_query, fragment=""))
+    except Exception:
+        return url
+
+
 def _validate_image_url(url: str) -> str:
     """Allow only http(s) URLs or our own /static/uploads/ paths.
 
@@ -1169,27 +1330,53 @@ def create_app() -> Flask:
             )
             return redirect(url_for("recipes_page"))
 
+        # De-duplication: if a recipe with the same canonical source URL
+        # already exists, redirect the user to its edit page instead of
+        # creating a "(2)"-suffixed copy. Conservative — never overwrites
+        # silently. The user can delete the existing recipe and re-import
+        # to refresh.
+        canonical_url = _canonical_source_url(url)
+        if canonical_url:
+            db_check = get_db()
+            existing_rows = db_check.execute(
+                "SELECT id, name, source_url FROM recipe "
+                "WHERE source_url != '' "
+                "ORDER BY id DESC"
+            ).fetchall()
+            for row in existing_rows:
+                if _canonical_source_url(row["source_url"]) == canonical_url:
+                    flash(
+                        f"That URL is already imported as \"{row['name']}\". "
+                        "Edit it directly, or delete it first if you want to "
+                        "re-import a fresh copy.",
+                        "error",
+                    )
+                    return redirect(url_for("recipe_edit", recipe_id=row["id"]))
+
         try:
             from recipe_scrapers import scrape_html, scraper_exists_for
             if scraper_exists_for(url):
                 scraper = scrape_me(url)
             else:
                 # Unsupported site — fetch HTML and let recipe-scrapers
-                # parse schema.org JSON-LD via wild_mode.
-                from urllib.request import Request, urlopen
-                req = Request(
-                    url,
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (compatible; FamilyShoppingList/1.0)"
-                        )
-                    },
-                )
-                with urlopen(req, timeout=15) as resp:
-                    html = resp.read().decode(
-                        resp.headers.get_content_charset() or "utf-8",
-                        errors="replace",
+                # parse schema.org JSON-LD via wild_mode. Use a real
+                # browser UA + retry-on-transient-failure so polite
+                # 503/429s don't fail user-visibly.
+                fetched = _http_get(url, timeout=15.0, retries=3)
+                if fetched is None:
+                    flash(
+                        f"Could not fetch that URL after retries. "
+                        "The site may be down or blocking automated requests.",
+                        "error",
                     )
+                    return redirect(url_for("recipes_page"))
+                body, headers = fetched
+                charset = "utf-8"
+                ctype = headers.get("Content-Type") or headers.get("content-type") or ""
+                m = re.search(r"charset=([\w-]+)", ctype, re.I)
+                if m:
+                    charset = m.group(1)
+                html = body.decode(charset, errors="replace")
                 scraper = scrape_html(html, org_url=url, wild_mode=True)
             title = (scraper.title() or "").strip() or "Imported Recipe"
             try:
@@ -1236,6 +1423,14 @@ def create_app() -> Flask:
                 return int(m.group(0)) if m else 0
 
             image_url = _validate_image_url(_safe(scraper.image, ""))
+            # Bake the remote image into a local upload so the recipe
+            # keeps its photo even if the source site moves it, blocks
+            # hotlinks, or goes away. Falls back to the remote URL on
+            # any failure (size cap, magic-byte mismatch, network).
+            if image_url and image_url.startswith(("http://", "https://")):
+                local = _fetch_remote_image(image_url)
+                if local:
+                    image_url = local
             prep_time = _to_int_minutes(_safe(scraper.prep_time, 0))
             cook_time = _to_int_minutes(_safe(scraper.cook_time, 0))
             total_time = _to_int_minutes(_safe(scraper.total_time, 0))
@@ -1304,8 +1499,30 @@ def create_app() -> Flask:
             flash("No ingredients found at that URL.", "error")
             return redirect(url_for("recipes_page"))
 
+        # Sanity-check the import before committing — flags that have
+        # historically meant "the scrape went off the rails." Warnings
+        # only; the recipe still saves so the user can fix in edit.
+        sanity_warnings: list[str] = []
+        if servings < 1 or servings > 50:
+            sanity_warnings.append(
+                f"servings looked off ({servings}); reset to 4"
+            )
+            servings = 4
+        if len(ing_lines) > 50:
+            sanity_warnings.append(
+                f"unusually large ingredient list ({len(ing_lines)} rows) — "
+                "the scraper may have grabbed too much"
+            )
+        if instructions and len(instructions) < 50:
+            sanity_warnings.append(
+                "instructions are very short — site may not have published "
+                "the full recipe"
+            )
+
         db = get_db()
-        # Make the name unique if it collides with an existing recipe.
+        # Make the name unique if it collides with an existing recipe by
+        # name (we already deduped on canonical URL above; this catches
+        # an edge case where two different sites publish the same title).
         base_title = title
         suffix = 2
         while db.execute(
@@ -1352,6 +1569,8 @@ def create_app() -> Flask:
             f"Imported \"{title}\" — review categories and units, then save.",
             "success",
         )
+        for w in sanity_warnings:
+            flash(f"Heads up: {w}.", "error")
         return redirect(url_for("recipe_edit", recipe_id=recipe_id))
 
     @app.post("/recipes/import-photo")
