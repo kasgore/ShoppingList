@@ -465,6 +465,68 @@ def _refresh_recipe_embedding(db, recipe_id: int) -> None:
     _embedding.upsert_recipe_embedding(db, recipe_id, text)
 
 
+def _delete_uploaded_image_file(
+    url: str, except_recipe_id: int | None = None
+) -> bool:
+    """Remove an uploaded image file from disk if no other recipe needs it.
+
+    Returns True if a file was actually deleted. Skipped silently when:
+      - `url` doesn't point at /static/uploads/ (external URLs are left alone)
+      - the file's already gone
+      - another recipe (other than `except_recipe_id`) still references it
+
+    Path-traversal hardened: rejects any url containing `..` / `/` / `\\`
+    in the basename and verifies the resolved path lives under UPLOAD_DIR.
+    """
+    if not url or not url.startswith("/static/uploads/"):
+        return False
+    basename = url[len("/static/uploads/"):]
+    if not basename or "/" in basename or "\\" in basename or ".." in basename:
+        return False
+    full = os.path.join(UPLOAD_DIR, basename)
+    try:
+        real_full = os.path.realpath(full)
+        real_dir = os.path.realpath(UPLOAD_DIR)
+        if os.path.commonpath([real_full, real_dir]) != real_dir:
+            return False
+    except (OSError, ValueError):
+        return False
+    if not os.path.isfile(full):
+        return False
+    db = get_db()
+    sql = "SELECT COUNT(*) FROM recipe WHERE image_url = ?"
+    params: list = [url]
+    if except_recipe_id is not None:
+        sql += " AND id != ?"
+        params.append(except_recipe_id)
+    if db.execute(sql, params).fetchone()[0] > 0:
+        return False
+    try:
+        os.remove(full)
+        return True
+    except OSError:
+        return False
+
+
+def _scan_orphan_images() -> list[str]:
+    """Return basenames in UPLOAD_DIR that no recipe.image_url references."""
+    if not os.path.isdir(UPLOAD_DIR):
+        return []
+    db = get_db()
+    referenced: set[str] = set()
+    for row in db.execute(
+        "SELECT image_url FROM recipe WHERE image_url != ''"
+    ).fetchall():
+        url = row["image_url"]
+        if url and url.startswith("/static/uploads/"):
+            referenced.add(url[len("/static/uploads/"):])
+    on_disk: set[str] = set()
+    for fname in os.listdir(UPLOAD_DIR):
+        if os.path.isfile(os.path.join(UPLOAD_DIR, fname)):
+            on_disk.add(fname)
+    return sorted(on_disk - referenced)
+
+
 def _validate_image_url(url: str) -> str:
     """Allow only http(s) URLs or our own /static/uploads/ paths.
 
@@ -1156,8 +1218,24 @@ def create_app() -> Flask:
     @app.route("/recipes/<int:recipe_id>/delete", methods=["POST"])
     def recipe_delete(recipe_id: int):
         db = get_db()
+        # Capture image_url before delete so we can clean up the file.
+        row = db.execute(
+            "SELECT image_url FROM recipe WHERE id = ?", (recipe_id,)
+        ).fetchone()
+        image_url = row["image_url"] if row else ""
+        # vec0 virtual tables don't honor FK cascades — clean up the
+        # embedding row explicitly. OperationalError = extension not
+        # loaded, table doesn't exist; safe to ignore.
+        try:
+            db.execute(
+                "DELETE FROM recipe_embedding WHERE recipe_id = ?", (recipe_id,)
+            )
+        except sqlite3.OperationalError:
+            pass
         db.execute("DELETE FROM recipe WHERE id = ?", (recipe_id,))
         db.commit()
+        if image_url:
+            _delete_uploaded_image_file(image_url, except_recipe_id=recipe_id)
         flash("Recipe deleted.", "success")
         return redirect(url_for("recipes_page"))
 
@@ -1323,13 +1401,44 @@ def create_app() -> Flask:
                     })
                 except OSError:
                     pass
+        orphans = _scan_orphan_images()
+        orphan_bytes = 0
+        for fname in orphans:
+            full = os.path.join(UPLOAD_DIR, fname)
+            try:
+                orphan_bytes += os.path.getsize(full)
+            except OSError:
+                pass
         return render_template(
             "backup.html",
             db_size=db_size,
             photo_count=photo_count,
             photo_bytes=photo_bytes,
             snapshots=snapshots,
+            orphan_count=len(orphans),
+            orphan_bytes=orphan_bytes,
         )
+
+    @app.post("/backup/cleanup-orphans")
+    def backup_cleanup_orphans():
+        orphans = _scan_orphan_images()
+        deleted = 0
+        for fname in orphans:
+            full = os.path.join(UPLOAD_DIR, fname)
+            try:
+                os.remove(full)
+                deleted += 1
+            except OSError:
+                pass
+        if deleted:
+            flash(
+                f"Removed {deleted} orphaned photo file"
+                f"{'' if deleted == 1 else 's'}.",
+                "success",
+            )
+        else:
+            flash("No orphaned photos to clean up.", "success")
+        return redirect(url_for("backup_page"))
 
     @app.get("/backup/download")
     def backup_download():
@@ -1681,6 +1790,15 @@ def create_app() -> Flask:
             servings = 4
 
         db = get_db()
+        # Capture the existing image_url before UPDATE so we can clean up
+        # the old uploaded file if the user replaced it.
+        old_image_url = ""
+        if recipe_id is not None:
+            old_row = db.execute(
+                "SELECT image_url FROM recipe WHERE id = ?", (recipe_id,)
+            ).fetchone()
+            if old_row:
+                old_image_url = old_row["image_url"] or ""
         try:
             if recipe_id is None:
                 cur = db.execute(
@@ -1741,6 +1859,12 @@ def create_app() -> Flask:
         db.commit()
         _refresh_recipe_embedding(db, recipe_id)
         db.commit()
+        # If the user replaced the image (or removed it), unlink the old
+        # uploaded file from disk so we don't accumulate orphans.
+        if old_image_url and old_image_url != image_url:
+            _delete_uploaded_image_file(
+                old_image_url, except_recipe_id=recipe_id
+            )
         flash(f"Saved recipe: {name}.", "success")
         return redirect(url_for("recipes_page"))
 

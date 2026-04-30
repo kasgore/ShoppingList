@@ -50,6 +50,28 @@
 </section>
 
 <section class="card">
+  <h2>Photo cleanup</h2>
+  <p class="muted">
+    Scan the uploads folder for image files that no recipe references —
+    leftovers from old deletes/edits before the cleanup hooks landed,
+    or copies left behind if a backup restore overwrote a recipe with
+    a different photo.
+  </p>
+  {% if orphan_count and orphan_count > 0 %}
+    <p>
+      <strong>{{ orphan_count }} orphan photo{{ '' if orphan_count == 1 else 's' }}</strong>
+      ({{ '%.1f' % (orphan_bytes / 1024 / 1024) }} MB).
+    </p>
+    <form action="{{ url_for('backup_cleanup_orphans') }}" method="post"
+          onsubmit="return confirm('Permanently delete {{ orphan_count }} orphaned photo file(s)?');">
+      <button type="submit" class="button danger">Remove orphan photos</button>
+    </form>
+  {% else %}
+    <p class="muted">No orphaned photos — every file in /static/uploads/ is referenced by a recipe.</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>Pre-restore snapshots</h2>
   {% if snapshots %}
     <p class="muted">
