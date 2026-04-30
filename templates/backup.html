@@ -50,6 +50,59 @@
 </section>
 
 <section class="card">
+  <h2>Automatic backups</h2>
+  {% if backup_enabled %}
+    <p class="muted">
+      A full backup ZIP (DB + photos) is written to
+      <code>{{ auto_backup_dir }}</code> nightly at the configured hour
+      (default 3 am). The 14 newest are kept on disk; older ones rotate
+      out automatically.
+    </p>
+    <p class="muted small-note">
+      Tip: mount that directory as a network share or rclone-sync it to
+      Backblaze B2 / Google Drive to get truly off-site copies. Right now
+      it lives on the Pi's volume — fine for "I broke the DB" but not for
+      "the Pi is gone."
+    </p>
+  {% else %}
+    <p class="muted">
+      Auto-backups are <strong>disabled</strong>
+      (<code>BACKUP_ENABLED=0</code> in the environment). Set
+      <code>BACKUP_ENABLED=1</code> to turn them on.
+    </p>
+  {% endif %}
+  <p>
+    <form action="{{ url_for('backup_auto_run_now') }}" method="post" class="inline">
+      <button type="submit" class="button primary">Run backup now</button>
+    </form>
+  </p>
+  {% if auto_backups %}
+    <ul class="chip-list">
+      {% for b in auto_backups %}
+        <li>
+          <span>
+            <strong>{{ b.mtime }}</strong>
+            <em class="muted">— {{ '%.1f' % (b.size / 1024 / 1024) }} MB</em>
+          </span>
+          <span class="actions">
+            <a href="{{ url_for('backup_auto_download', name=b.name) }}"
+               class="button">Download</a>
+            <form action="{{ url_for('backup_auto_delete', name=b.name) }}"
+                  method="post" class="inline"
+                  onsubmit="return confirm('Delete {{ b.name }}?');">
+              <button class="button danger">Delete</button>
+            </form>
+          </span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">No automatic backups yet — the next scheduled run will create one,
+      or click "Run backup now" above.</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>Photo cleanup</h2>
   <p class="muted">
     Scan the uploads folder for image files that no recipe references —

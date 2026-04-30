@@ -7,3 +7,5 @@ pillow-heif>=0.16
 # search if either is missing or fails to load.
 fastembed>=0.4
 sqlite-vec>=0.1.6
+# Background scheduler for nightly automatic backups.
+APScheduler>=3.10

@@ -7,6 +7,100 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+// Cook Mode: full-screen step-by-step recipe view with Wake Lock so the
+// screen stays on while hands are messy. Wake Lock is stable on iOS 16.4+
+// in installed PWAs and Chrome Android since 2021. Falls back gracefully
+// (the page works, the screen just sleeps normally).
+(function setupCookMode() {
+  const root = document.getElementById("cook-mode");
+  if (!root) return;
+  const dataNode = document.getElementById("cook-steps-data");
+  const steps = dataNode ? JSON.parse(dataNode.textContent || "[]") : [];
+  if (!steps.length) return;
+
+  const stepText = document.getElementById("cook-step-text");
+  const counter = document.getElementById("cook-current");
+  const prevBtn = document.getElementById("cook-prev");
+  const nextBtn = document.getElementById("cook-next");
+  const progress = document.getElementById("cook-progress");
+  const wakeIndicator = document.getElementById("cook-wake-indicator");
+  let current = 0;
+
+  function render() {
+    stepText.textContent = steps[current];
+    counter.textContent = String(current + 1);
+    progress.value = current + 1;
+    prevBtn.disabled = current === 0;
+    nextBtn.disabled = current === steps.length - 1;
+  }
+  function go(delta) {
+    const next = current + delta;
+    if (next < 0 || next >= steps.length) return;
+    current = next;
+    render();
+  }
+
+  prevBtn.addEventListener("click", () => go(-1));
+  nextBtn.addEventListener("click", () => go(1));
+
+  // Keyboard navigation for desktop / iPad with keyboard.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") go(-1);
+    else if (e.key === "ArrowRight") go(1);
+  });
+
+  // Touch-swipe navigation. Threshold is 60 px to avoid accidental swipes
+  // while scrolling the ingredient panel.
+  let touchStartX = null;
+  let touchStartY = null;
+  root.addEventListener("touchstart", (e) => {
+    touchStartX = e.touches[0].clientX;
+    touchStartY = e.touches[0].clientY;
+  }, { passive: true });
+  root.addEventListener("touchend", (e) => {
+    if (touchStartX == null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    const dy = e.changedTouches[0].clientY - touchStartY;
+    // Only trigger on mostly-horizontal swipes — vertical scrolling
+    // shouldn't change the step.
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      if (dx < 0) go(1);
+      else go(-1);
+    }
+    touchStartX = null;
+    touchStartY = null;
+  }, { passive: true });
+
+  // Wake Lock — keep the screen on while cooking.
+  let wakeLock = null;
+  async function requestWakeLock() {
+    if (!("wakeLock" in navigator)) {
+      if (wakeIndicator) wakeIndicator.textContent = "screen may sleep";
+      return;
+    }
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      if (wakeIndicator) wakeIndicator.textContent = "screen-on ⚡";
+      wakeLock.addEventListener("release", () => {
+        if (wakeIndicator) wakeIndicator.textContent = "screen released";
+      });
+    } catch (err) {
+      console.warn("Wake lock failed:", err);
+      if (wakeIndicator) wakeIndicator.textContent = "screen lock denied";
+    }
+  }
+  // Browsers release the wake lock when the tab is hidden. Re-request
+  // when it becomes visible again.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      requestWakeLock();
+    }
+  });
+  requestWakeLock();
+
+  render();
+})();
+
 // Real-time list sync: open an EventSource on the home page so when one
 // family member checks an item off (or adds one) every other phone
 // updates within a second. Reload is debounced + skipped while the user

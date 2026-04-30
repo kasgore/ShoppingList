@@ -36,10 +36,12 @@ from ingredient import (
     CATEGORIES,
     UNIT_ALIASES,
     format_quantity,
+    from_canonical,
     guess_category,
     normalize_name,
     normalize_unit,
     parse_ingredient,
+    to_canonical_qty,
 )
 from ocr import _ocr_image_to_text, _parse_ocr_recipe
 
@@ -92,8 +94,15 @@ class AggregatedItem:
 
 
 def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem]]:
-    """Walk the active list_recipe rows, aggregate ingredients by
-    (normalized name, normalized unit), then append ad-hoc items."""
+    """Walk the active list_recipe rows, aggregate ingredients, then
+    append ad-hoc items.
+
+    Aggregation merges by (normalized name, dimension) when the unit is
+    known to belong to a physical dimension (volume/mass), so that
+    "1 cup butter" + "8 tbsp butter" become one line. Unknown units
+    (sticks, cans, cloves, no-unit) fall back to exact (name, unit)
+    matching.
+    """
     list_rows = db.execute(
         "SELECT lr.id AS lr_id, lr.multiplier, lr.added_by, "
         "       r.id AS recipe_id, r.name AS recipe_name "
@@ -103,6 +112,10 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
 
     # key -> AggregatedItem
     bucket: dict[str, AggregatedItem] = {}
+    # For dim-keyed buckets, track the running sum in canonical base
+    # units (mL for volume, g for mass) so we can re-derive a sensible
+    # display unit at the end after all merging is done.
+    canonical_sums: dict[str, list] = {}  # key -> [dimension, base_total]
 
     for lr in list_rows:
         ings = db.execute(
@@ -113,14 +126,22 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
         for ing in ings:
             n_name = normalize_name(ing["name"])
             n_unit = normalize_unit(ing["unit"])
-            key = f"recipe::{n_name}::{n_unit}"
             qty = float(ing["quantity"]) * float(lr["multiplier"])
+            canonical = to_canonical_qty(qty, n_unit)
+            if canonical is not None:
+                dimension, base_qty = canonical
+                key = f"recipe::{n_name}::dim:{dimension}"
+            else:
+                key = f"recipe::{n_name}::{n_unit}"
             source_label = lr["recipe_name"]
             if lr["multiplier"] != 1:
                 source_label += f" (×{format_quantity(lr['multiplier'])})"
             if key in bucket:
                 item = bucket[key]
-                item.quantity += qty
+                if canonical is not None:
+                    canonical_sums[key][1] += base_qty
+                else:
+                    item.quantity += qty
                 if source_label not in item.sources:
                     item.sources.append(source_label)
             else:
@@ -133,6 +154,16 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
                     sources=[source_label],
                     note=ing["note"] or "",
                 )
+                if canonical is not None:
+                    canonical_sums[key] = [canonical[0], canonical[1]]
+
+    # Re-derive display quantity + unit for dim-keyed buckets now that
+    # all merging is done.
+    for key, (dimension, base_total) in canonical_sums.items():
+        item = bucket[key]
+        new_qty, new_unit = from_canonical(base_total, dimension)
+        item.quantity = new_qty
+        item.unit = new_unit
 
     # Ad-hoc items: each is its own row even if it duplicates a recipe item,
     # so the requester gets the exact thing they asked for.
@@ -409,17 +440,31 @@ def _broadcast(event_type: str, data: str = "1") -> None:
 def _top_predicted_items(db, limit: int = 8) -> list[dict]:
     """Return up to `limit` items the user is likely to want to add next.
 
-    Scoring blends recency and frequency over the last 90 days of
-    ad-hoc adds. Items already on the active shopping list are skipped
-    so we don't suggest duplicates of what's already there.
+    Combines four signals over the user's purchase history:
+      * **recency**       – how long since the item was last added
+      * **frequency**     – how often it's been added
+      * **co-occurrence** – how often it's been added in the same trip
+                            as something already in the cart right now
+      * **replenishment** – proximity to the user's typical
+                            inter-purchase interval (a bell curve around
+                            the average gap between past purchases)
 
-    Pure SQL + Python, no ML. Magic feel comes from "you usually buy
-    bananas every Sunday" patterns surfacing as one-tap chips.
+    Items already on the active list (recipe-derived ingredients OR
+    ad-hoc adds) are skipped so we don't suggest duplicates.
+
+    Pure SQL + Python, no ML. The "feels magical" property comes from
+    surfacing patterns the family already has rather than predicting
+    new behavior.
     """
     # What's already on the list — exclude these from suggestions.
-    on_list = {row["name"].strip().lower() for row in db.execute(
-        "SELECT name FROM adhoc_item"
-    ).fetchall()}
+    on_list: set[str] = set()
+    for row in db.execute("SELECT name FROM adhoc_item").fetchall():
+        on_list.add(row["name"].strip().lower())
+    for row in db.execute(
+        "SELECT i.name FROM ingredient i "
+        "INNER JOIN list_recipe lr ON lr.recipe_id = i.recipe_id"
+    ).fetchall():
+        on_list.add(row["name"].strip().lower())
 
     rows = db.execute(
         "SELECT name, unit, COUNT(*) AS freq, "
@@ -433,19 +478,104 @@ def _top_predicted_items(db, limit: int = 8) -> list[dict]:
     if not rows:
         return []
 
+    # Co-occurrence: pairs of items added within a 24-hour window of
+    # each other. Only keep pairs that have appeared together at least
+    # twice — once is noise, twice is a pattern.
+    cooccur: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    cooccur_rows = db.execute(
+        """
+        SELECT LOWER(a.name) AS a_name,
+               LOWER(b.name) AS b_name,
+               COUNT(*) AS cnt
+        FROM purchase_history a
+        JOIN purchase_history b
+          ON a.id < b.id
+         AND ABS(julianday(a.checked_at) - julianday(b.checked_at)) <= 1.0
+         AND LOWER(a.name) <> LOWER(b.name)
+        WHERE a.checked_at >= datetime('now', '-180 days')
+        GROUP BY LOWER(a.name), LOWER(b.name)
+        HAVING cnt >= 2
+        ORDER BY cnt DESC
+        LIMIT 200
+        """
+    ).fetchall()
+    for cr in cooccur_rows:
+        cooccur[cr["a_name"]][cr["b_name"]] = cr["cnt"]
+        cooccur[cr["b_name"]][cr["a_name"]] = cr["cnt"]
+
+    # Replenishment cycle: average gap between purchases of the same
+    # item, plus the most recent purchase date. Requires ≥2 purchases
+    # to even compute a gap.
+    cycle: dict[str, tuple[float, str]] = {}
+    cycle_rows = db.execute(
+        """
+        WITH recent AS (
+            SELECT LOWER(name) AS name,
+                   checked_at,
+                   LAG(checked_at) OVER (
+                       PARTITION BY LOWER(name) ORDER BY checked_at
+                   ) AS prev_at
+            FROM purchase_history
+            WHERE checked_at >= datetime('now', '-365 days')
+        )
+        SELECT name,
+               AVG(julianday(checked_at) - julianday(prev_at)) AS avg_gap,
+               MAX(checked_at) AS last_at,
+               COUNT(*) AS gaps
+        FROM recent
+        WHERE prev_at IS NOT NULL
+        GROUP BY name
+        HAVING gaps >= 1
+        """
+    ).fetchall()
+    for cr in cycle_rows:
+        cycle[cr["name"]] = (float(cr["avg_gap"] or 0.0), cr["last_at"])
+
     now = datetime.utcnow()
     scored: list[tuple[float, dict]] = []
     for r in rows:
-        if r["name"].strip().lower() in on_list:
+        name_lower = r["name"].strip().lower()
+        if name_lower in on_list:
             continue
         try:
             last = datetime.fromisoformat(r["last_at"])
         except (TypeError, ValueError):
             continue
         days_ago = max(1, (now - last).days)
-        recency = 1.0 / days_ago
-        freq = min(1.0, r["freq"] / 8.0)
-        score = 0.6 * recency + 0.4 * freq
+
+        # Component scores in [0, 1].
+        recency_score = min(1.0, 1.0 / days_ago)
+        frequency_score = min(1.0, r["freq"] / 8.0)
+
+        cooccur_score = 0.0
+        partners = cooccur.get(name_lower, {})
+        if partners and on_list:
+            raw = sum(partners.get(c, 0) for c in on_list)
+            cooccur_score = min(1.0, raw / 5.0)
+
+        replenish_score = 0.0
+        cyc = cycle.get(name_lower)
+        if cyc:
+            avg_gap, last_iso = cyc
+            if avg_gap > 0:
+                try:
+                    last_purchase = datetime.fromisoformat(last_iso)
+                    days_since = (now - last_purchase).days
+                    # Bell-curve-ish around expected interval. Peaks at
+                    # ratio = 1 (item is "due"), tails to 0 outside the
+                    # 0.5x-2x window.
+                    ratio = days_since / avg_gap
+                    if 0.5 <= ratio <= 2.0:
+                        replenish_score = max(0.0, 1.0 - abs(ratio - 1.0))
+                except (TypeError, ValueError):
+                    pass
+
+        score = (
+            0.30 * recency_score
+            + 0.20 * frequency_score
+            + 0.30 * cooccur_score
+            + 0.20 * replenish_score
+        )
         scored.append((score, {
             "name": r["name"],
             "unit": r["unit"],
@@ -525,6 +655,109 @@ def _delete_uploaded_image_file(
         return True
     except OSError:
         return False
+
+
+def _auto_backup_dir() -> str:
+    """Where automatic nightly backups land. Override via BACKUP_DIR
+    env var — typically a mounted network share so backups land
+    off-Pi without an extra cron."""
+    return os.environ.get(
+        "BACKUP_DIR", os.path.join(os.path.dirname(DB_PATH), "backups")
+    )
+
+
+def _scheduled_auto_backup() -> None:
+    """Background-scheduler entrypoint: write a full backup ZIP to
+    BACKUP_DIR and prune old auto-backups beyond BACKUP_RETAIN_COUNT.
+    Errors are swallowed so the scheduler thread keeps running.
+    """
+    try:
+        backup_dir = _auto_backup_dir()
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = os.path.join(backup_dir, f"auto-backup-{ts}.zip")
+        _write_full_backup_zip(out_path)
+        try:
+            keep = max(1, int(os.environ.get("BACKUP_RETAIN_COUNT", "14")))
+        except ValueError:
+            keep = 14
+        _rotate_auto_backups(backup_dir, keep=keep)
+    except Exception as exc:
+        # Log to stdout — gunicorn's access log captures this.
+        print(f"[auto-backup] scheduled backup failed: {exc}", flush=True)
+
+
+def _rotate_auto_backups(backup_dir: str, keep: int = 14) -> None:
+    """Keep at most `keep` newest auto-backup-*.zip files in `backup_dir`."""
+    if not os.path.isdir(backup_dir):
+        return
+    snapshots: list[tuple[float, str]] = []
+    for fname in os.listdir(backup_dir):
+        if not (fname.startswith("auto-backup-") and fname.endswith(".zip")):
+            continue
+        full = os.path.join(backup_dir, fname)
+        try:
+            snapshots.append((os.path.getmtime(full), full))
+        except OSError:
+            pass
+    snapshots.sort(reverse=True)
+    for _, full in snapshots[keep:]:
+        try:
+            os.remove(full)
+        except OSError:
+            pass
+
+
+def _list_auto_backups() -> list[dict]:
+    """Return metadata about every auto-backup file currently on disk
+    (newest first), for display on the /backup page."""
+    backup_dir = _auto_backup_dir()
+    if not os.path.isdir(backup_dir):
+        return []
+    out = []
+    for fname in os.listdir(backup_dir):
+        if not (fname.startswith("auto-backup-") and fname.endswith(".zip")):
+            continue
+        full = os.path.join(backup_dir, fname)
+        try:
+            out.append({
+                "name": fname,
+                "size": os.path.getsize(full),
+                "mtime": datetime.fromtimestamp(
+                    os.path.getmtime(full)
+                ).strftime("%Y-%m-%d %H:%M"),
+            })
+        except OSError:
+            pass
+    out.sort(key=lambda x: x["mtime"], reverse=True)
+    return out
+
+
+def _start_auto_backup_scheduler() -> None:
+    """Wire up APScheduler for the nightly backup job. Best-effort —
+    if APScheduler isn't installed (e.g., on a slimmed-down deploy)
+    or BACKUP_ENABLED is "0", the app continues without auto-backups."""
+    if os.environ.get("BACKUP_ENABLED", "1") == "0":
+        return
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+    except ImportError:
+        return
+    try:
+        hour = int(os.environ.get("BACKUP_HOUR", "3"))
+        minute = int(os.environ.get("BACKUP_MINUTE", "0"))
+    except ValueError:
+        hour, minute = 3, 0
+    scheduler = BackgroundScheduler(daemon=True)
+    scheduler.add_job(
+        _scheduled_auto_backup,
+        CronTrigger(hour=hour, minute=minute),
+        id="kasa_auto_backup",
+        replace_existing=True,
+        misfire_grace_time=3600,  # if the Pi was off, run within an hour
+    )
+    scheduler.start()
 
 
 def _rotate_pre_restore_snapshots(keep: int = 5) -> None:
@@ -1270,6 +1503,33 @@ def create_app() -> Flask:
             steps=steps,
         )
 
+    @app.route("/recipes/<int:recipe_id>/cook")
+    def recipe_cook(recipe_id: int):
+        """Full-screen step-by-step cooking view with screen Wake Lock.
+
+        Pulls out the instructions as a JSON-friendly list so the
+        client-side JS can navigate between steps without hitting the
+        server. Wake Lock keeps the iPad/phone screen on while cooking.
+        """
+        recipe = _get_recipe(recipe_id)
+        if recipe is None:
+            flash("Recipe not found.", "error")
+            return redirect(url_for("recipes_page"))
+        db = get_db()
+        ingredients = db.execute(
+            "SELECT id, name, quantity, unit, category, note "
+            "FROM ingredient WHERE recipe_id = ? ORDER BY id",
+            (recipe_id,),
+        ).fetchall()
+        raw = (recipe["instructions"] or "").strip()
+        steps = [s.strip() for s in re.split(r"\n+", raw) if s.strip()] if raw else []
+        return render_template(
+            "cook_mode.html",
+            recipe=recipe,
+            ingredients=ingredients,
+            steps=steps,
+        )
+
     @app.route("/recipes/new", methods=["GET", "POST"])
     def recipe_new():
         if request.method == "POST":
@@ -1498,6 +1758,8 @@ def create_app() -> Flask:
                 orphan_bytes += os.path.getsize(full)
             except OSError:
                 pass
+        auto_backups = _list_auto_backups()
+        auto_backup_dir = _auto_backup_dir()
         return render_template(
             "backup.html",
             db_size=db_size,
@@ -1506,7 +1768,53 @@ def create_app() -> Flask:
             snapshots=snapshots,
             orphan_count=len(orphans),
             orphan_bytes=orphan_bytes,
+            auto_backups=auto_backups,
+            auto_backup_dir=auto_backup_dir,
+            backup_enabled=os.environ.get("BACKUP_ENABLED", "1") != "0",
         )
+
+    @app.post("/backup/auto/run-now")
+    def backup_auto_run_now():
+        """Trigger an immediate auto-backup outside the scheduled window —
+        useful for "I'm about to do something risky, snapshot now."""
+        try:
+            _scheduled_auto_backup()
+            flash("Backup written.", "success")
+        except Exception as exc:
+            flash(f"Backup failed: {exc}", "error")
+        return redirect(url_for("backup_page"))
+
+    _AUTO_BACKUP_NAME_RE = re.compile(
+        r"auto-backup-[0-9]{8}-[0-9]{6}\.zip"
+    )
+
+    @app.get("/backup/auto/<name>")
+    def backup_auto_download(name: str):
+        if not _AUTO_BACKUP_NAME_RE.fullmatch(name):
+            return ("Not found", 404)
+        full = os.path.join(_auto_backup_dir(), name)
+        if not os.path.isfile(full):
+            return ("Not found", 404)
+        return send_file(
+            full,
+            as_attachment=True,
+            download_name=name,
+            mimetype="application/zip",
+        )
+
+    @app.post("/backup/auto/<name>/delete")
+    def backup_auto_delete(name: str):
+        if not _AUTO_BACKUP_NAME_RE.fullmatch(name):
+            flash("Invalid backup name.", "error")
+            return redirect(url_for("backup_page"))
+        full = os.path.join(_auto_backup_dir(), name)
+        if os.path.isfile(full):
+            try:
+                os.remove(full)
+                flash(f"Deleted {name}.", "success")
+            except OSError as exc:
+                flash(f"Could not delete: {exc}", "error")
+        return redirect(url_for("backup_page"))
 
     @app.post("/backup/cleanup-orphans")
     def backup_cleanup_orphans():
@@ -1985,6 +2293,9 @@ def create_app() -> Flask:
 
     # Make sure DB exists.
     init_db()
+    # Kick off the nightly auto-backup scheduler. No-op if APScheduler
+    # isn't installed or BACKUP_ENABLED=0.
+    _start_auto_backup_scheduler()
     return app
 
 

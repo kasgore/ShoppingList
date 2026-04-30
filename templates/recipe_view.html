@@ -48,6 +48,8 @@
       </p>
     </div>
     <div class="actions">
+      <a href="{{ url_for('recipe_cook', recipe_id=recipe.id) }}"
+         class="button primary">Cook ⚡</a>
       <button onclick="window.print()" class="button" type="button">Print</button>
       <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}" class="button">Edit</a>
       <a href="{{ url_for('recipes_page') }}" class="button">All recipes</a>

@@ -85,6 +85,83 @@ def normalize_unit(unit: str | None) -> str:
     return UNIT_ALIASES.get(unit.strip().lower(), unit.strip().lower())
 
 
+# Units that share a physical dimension can be aggregated even if recipes
+# stored them differently — "1 cup butter" + "8 tbsp butter" should land
+# on the shopping list as one row, not two. Each entry maps a normalized
+# unit (post-UNIT_ALIASES) to (dimension, factor_to_base_unit).
+#
+# Bases:
+#   volume → milliliters (mL)
+#   mass   → grams (g)
+#
+# "oz" is treated as mass here. Recipe convention is that "fl oz" is
+# volume; bare "oz" usually means weight (cheese, meat). We only
+# canonicalize when the unit appears in this map; everything else stays
+# in its native form so recipes using "stick", "clove", "can", or no
+# unit at all continue to aggregate by exact-match.
+UNIT_DIMENSIONS: dict[str, tuple[str, float]] = {
+    # Volume → mL
+    "tsp":   ("volume",   4.92892),
+    "tbsp":  ("volume",  14.78676),
+    "cup":   ("volume", 236.588),
+    "ml":    ("volume",   1.0),
+    "l":     ("volume", 1000.0),
+    "pint":  ("volume", 473.176),
+    "quart": ("volume", 946.353),
+    "gallon": ("volume", 3785.41),
+    # Mass → g
+    "g":     ("mass",       1.0),
+    "kg":    ("mass",    1000.0),
+    "oz":    ("mass",      28.3495),
+    "lb":    ("mass",     453.592),
+}
+
+# Display breakpoints: (max_value_in_base_unit, display_unit).
+# When the aggregated total in base units is < max_value, render in
+# display_unit. Last entry uses inf to catch the tail.
+_VOLUME_DISPLAY_BREAKPOINTS: list[tuple[float, str]] = [
+    (15.0, "tsp"),       # under one tablespoon (~3 tsp) → tsp
+    (180.0, "tbsp"),     # under three-quarters of a cup → tbsp
+    (1000.0, "cup"),     # under a liter → cup
+    (float("inf"), "l"), # otherwise liters
+]
+_MASS_DISPLAY_BREAKPOINTS: list[tuple[float, str]] = [
+    (28.0, "g"),         # under an ounce → grams
+    (1000.0, "oz"),      # under a kilogram → ounces
+    (float("inf"), "kg"),
+]
+
+
+def to_canonical_qty(qty: float, unit: str) -> tuple[str, float] | None:
+    """If `unit` belongs to a known physical dimension (volume / mass),
+    convert `qty` to base units and return (dimension, base_qty).
+    Returns None for unknown units — caller should keep the original."""
+    u = (unit or "").strip().lower()
+    info = UNIT_DIMENSIONS.get(u)
+    if info is None:
+        return None
+    dimension, factor = info
+    return dimension, qty * factor
+
+
+def from_canonical(qty_in_base: float, dimension: str) -> tuple[float, str]:
+    """Pick a sensible display unit + quantity for an aggregated total
+    expressed in canonical base units. Returns (display_qty, display_unit)."""
+    if dimension == "volume":
+        breakpoints = _VOLUME_DISPLAY_BREAKPOINTS
+    elif dimension == "mass":
+        breakpoints = _MASS_DISPLAY_BREAKPOINTS
+    else:
+        return qty_in_base, ""
+    for max_val, display_unit in breakpoints:
+        if qty_in_base < max_val:
+            _, target_factor = UNIT_DIMENSIONS[display_unit]
+            return qty_in_base / target_factor, display_unit
+    # Safety net — shouldn't reach here because the last breakpoint is inf.
+    last_unit = breakpoints[-1][1]
+    return qty_in_base / UNIT_DIMENSIONS[last_unit][1], last_unit
+
+
 def normalize_name(name: str) -> str:
     return name.strip().lower()
 

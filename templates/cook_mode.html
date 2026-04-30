@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}{{ recipe.name }} — Cooking · Kasa{% endblock %}
+
+{% block content %}
+<div id="cook-mode" class="cook-mode" data-recipe-id="{{ recipe.id }}">
+  <header class="cook-bar">
+    <a href="{{ url_for('recipe_view', recipe_id=recipe.id) }}" class="cook-exit"
+       aria-label="Exit cook mode">← Exit</a>
+    <span class="cook-title">{{ recipe.name }}</span>
+    <span class="cook-wake-indicator" id="cook-wake-indicator" aria-live="polite"
+          title="Screen Wake Lock status"></span>
+  </header>
+
+  <div class="cook-layout">
+    <aside class="cook-ings" aria-label="Ingredients checklist">
+      <h2>Ingredients</h2>
+      {% if ingredients %}
+        <ul class="cook-ings-list">
+          {% for ing in ingredients %}
+            <li>
+              <label class="cook-ing-row">
+                <input type="checkbox" data-ing-id="{{ ing.id }}">
+                <span class="cook-ing-qty">
+                  {% if ing.quantity %}{{ ing.quantity|fmtqty }}{% endif %}
+                  {% if ing.unit %}{{ ing.unit }}{% endif %}
+                </span>
+                <span class="cook-ing-name">{{ ing.name }}</span>
+                {% if ing.note %}<span class="cook-ing-note">— {{ ing.note }}</span>{% endif %}
+              </label>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="muted">No ingredients saved.</p>
+      {% endif %}
+    </aside>
+
+    <main class="cook-main">
+      {% if steps %}
+        <div class="cook-meta">
+          <span class="cook-counter">
+            Step <span id="cook-current">1</span>
+            of <span id="cook-total">{{ steps|length }}</span>
+          </span>
+          <progress id="cook-progress" max="{{ steps|length }}" value="1"></progress>
+        </div>
+
+        <div class="cook-step" id="cook-step-text" aria-live="polite">
+          {{ steps[0] }}
+        </div>
+
+        <div class="cook-nav">
+          <button id="cook-prev" class="cook-nav-btn" disabled
+                  aria-label="Previous step">← Previous</button>
+          <button id="cook-next" class="cook-nav-btn primary"
+                  aria-label="Next step">Next →</button>
+        </div>
+
+        <p class="muted small-note cook-hint">
+          Swipe left/right or use ← →. Screen stays on while you're here.
+        </p>
+      {% else %}
+        <p class="empty">
+          No instructions saved for this recipe yet.
+          <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}">Add some →</a>
+        </p>
+      {% endif %}
+    </main>
+  </div>
+
+  {% if steps %}
+    <script type="application/json" id="cook-steps-data">{{ steps|tojson }}</script>
+  {% endif %}
+</div>
+{% endblock %}
