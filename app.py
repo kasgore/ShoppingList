@@ -678,7 +678,7 @@ def _scheduled_auto_backup() -> None:
         out_path = os.path.join(backup_dir, f"auto-backup-{ts}.zip")
         _write_full_backup_zip(out_path)
         try:
-            keep = max(1, int(os.environ.get("BACKUP_RETAIN_COUNT", "14")))
+            keep = max(1, int(os.environ.get("BACKUP_RETAIN_COUNT", "7")))
         except ValueError:
             keep = 14
         _rotate_auto_backups(backup_dir, keep=keep)
