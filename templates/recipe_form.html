@@ -103,10 +103,17 @@
         </select>
       </label>
       <label class="grow">
-        <span>Image URL</span>
-        <input type="url" name="image_url"
+        <span>Image URL or path</span>
+        {# `type="text"` not `"url"` — locally-baked images stored as
+           /static/uploads/... are valid here but fail the browser's
+           strict URL validator. Server-side _validate_image_url still
+           rejects javascript:/data:/etc. #}
+        <input type="text" name="image_url"
                value="{{ recipe.image_url if recipe and recipe.image_url else '' }}"
-               placeholder="https://...">
+               placeholder="https://… or /static/uploads/…"
+               pattern="^(https?://.+|/static/uploads/.+)?$"
+               title="https:// URL or /static/uploads/ path"
+               inputmode="url">
       </label>
     </div>
     <div class="row photo-row">
