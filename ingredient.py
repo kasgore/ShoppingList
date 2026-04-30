@@ -244,6 +244,44 @@ def _parse_quantity_token(text: str) -> tuple[float | None, str]:
 _UNICODE_SPACES_RE = re.compile("[    ]")
 
 
+_QTY_MODIFIER_RE = re.compile(
+    r"^\s*(?:scant|about|approximately|approx\.?|roughly|heaping|"
+    r"generous|generously|rounded|good|big|small|large|tiny)\s+",
+    re.IGNORECASE,
+)
+# Trailing parenthetical at the end of an ingredient — "(1/2 medium)",
+# "(or 1 cup goat cheese)" — meant as a note to the cook, not part of
+# the ingredient name. Captured even when the closing paren is missing
+# (recipe-scrapers occasionally truncates).
+_TRAILING_PAREN_RE = re.compile(r"\s*\(([^)]{2,})\)?\s*$")
+
+# Trailing prepositional / qualifier phrases meaning "this isn't really
+# a measured ingredient" — keep the ingredient, capture the qualifier.
+# Anchored at end of string so we don't accidentally clip the middle of
+# names like "for the cake".
+_TRAILING_QUALIFIER_RE = re.compile(
+    r",?\s+("
+    r"to\s+taste|"
+    r"as\s+needed|"
+    r"for\s+serving|"
+    r"for\s+garnish|"
+    r"for\s+drizzling|"
+    r"for\s+dusting|"
+    r"for\s+sprinkling|"
+    r"if\s+desired|"
+    r"optional|"
+    r"plus\s+more\s+(?:for\s+\w+|to\s+taste)|"
+    r"divided"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# Mid-string parenthetical that immediately follows the quantity — the
+# "(15 oz)" in "1 (15 oz) can crushed tomatoes" describes the package
+# size, not the quantity itself. Becomes a note.
+_POST_QTY_PAREN_RE = re.compile(r"^\s*\(([^)]+)\)\s+")
+
+
 def parse_ingredient(line: str) -> dict:
     """Parse a free-form ingredient string like '1 1/2 cups flour, sifted'
     into {name, quantity, unit, note}. Best-effort; the user can fix up
@@ -258,6 +296,33 @@ def parse_ingredient(line: str) -> dict:
     # Must happen before quantity parsing — otherwise "- 1 pound" yields no qty.
     original = re.sub(r"^[-*•·–—]+\s*", "", original)
 
+    # Capture modifier prefix as a note, then strip it so the quantity
+    # parser sees "½ teaspoon kosher salt" instead of "Scant ½ teaspoon
+    # kosher salt". Common in real-world recipes.
+    leading_modifier = ""
+    mod_match = _QTY_MODIFIER_RE.match(original)
+    if mod_match:
+        leading_modifier = mod_match.group(0).strip().rstrip(",").lower()
+        original = original[mod_match.end():]
+
+    # Capture trailing parenthetical as a note. Done before quantity
+    # parsing so "1 small garlic clove (1/2 medium)" doesn't drag the
+    # "(1/2 medium)" into the name field.
+    trailing_note = ""
+    trail_match = _TRAILING_PAREN_RE.search(original)
+    if trail_match:
+        trailing_note = trail_match.group(1).strip()
+        original = original[:trail_match.start()].rstrip()
+
+    # Capture trailing qualifier phrases ("to taste", "for serving",
+    # etc.) as a note. Same reason — they aren't part of the ingredient
+    # name and clutter the shopping list.
+    trailing_qualifier = ""
+    qual_match = _TRAILING_QUALIFIER_RE.search(original)
+    if qual_match:
+        trailing_qualifier = qual_match.group(1).strip().lower()
+        original = original[:qual_match.start()].rstrip()
+
     qty, rest = _parse_quantity_token(original)
     if qty is not None:
         m = re.match(r"^\s*[-–to]+\s*", rest)
@@ -268,12 +333,33 @@ def parse_ingredient(line: str) -> dict:
                 qty = qty2
                 rest = rest3
 
+    # Strip a parenthetical that sits between the quantity and the rest
+    # of the ingredient — "(15 oz)" in "1 (15 oz) can crushed tomatoes"
+    # is the package size, not part of the name.
+    post_paren_note = ""
+    if qty is not None:
+        post_match = _POST_QTY_PAREN_RE.match(rest)
+        if post_match:
+            post_paren_note = post_match.group(1).strip()
+            rest = rest[post_match.end():]
+
     rest = rest.strip()
 
     note = ""
     if "," in rest:
         head, _, tail = rest.partition(",")
         rest, note = head.strip(), tail.strip()
+    # Merge in every note-piece we lifted off elsewhere. Order:
+    # leading modifier, post-quantity paren, comma-tail, trailing
+    # qualifier, trailing paren.
+    note_parts = [p for p in (
+        leading_modifier,
+        post_paren_note,
+        note,
+        trailing_qualifier,
+        trailing_note,
+    ) if p]
+    note = "; ".join(note_parts)
 
     rest = re.sub(r"^of\s+", "", rest, flags=re.I)
 

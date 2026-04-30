@@ -212,6 +212,120 @@ class TestParseIngredient:
         assert result["unit"] == "lb"
         assert "ground beef" in result["name"]
 
+    # Real-world cases from the acouplecooks.com homemade-pizza scrape.
+    def test_leading_modifier_scant(self):
+        result = parse_ingredient("Scant ½ teaspoon kosher salt")
+        assert result["quantity"] == 0.5
+        assert result["unit"] == "tsp"
+        assert "kosher salt" in result["name"].lower()
+        assert "scant" in result["note"].lower()
+
+    def test_leading_modifier_about(self):
+        result = parse_ingredient("About 2 cups flour")
+        assert result["quantity"] == 2.0
+        assert result["unit"] == "cup"
+        assert result["name"].lower() == "flour"
+        assert "about" in result["note"].lower()
+
+    def test_leading_modifier_heaping(self):
+        result = parse_ingredient("Heaping 1 tablespoon sugar")
+        assert result["quantity"] == 1.0
+        assert result["unit"] == "tbsp"
+        assert "heaping" in result["note"].lower()
+
+    def test_trailing_parenthetical_captured_as_note(self):
+        result = parse_ingredient("1 small garlic clove (1/2 medium)")
+        assert result["quantity"] == 1.0
+        # "small" is a leading modifier — captured as note
+        assert "garlic clove" in result["name"].lower()
+        # The "(1/2 medium)" parenthetical → note
+        assert "1/2 medium" in result["note"]
+
+    def test_unclosed_trailing_parenthetical_still_captured(self):
+        # recipe-scrapers occasionally truncates; we still treat
+        # everything from "(" onward as a note.
+        result = parse_ingredient(
+            "3/4 cup mozzarella (or 1/2 cup mozzarella and 2 oz goat cheese"
+        )
+        assert result["quantity"] == 0.75
+        assert result["unit"] == "cup"
+        assert "mozzarella" in result["name"].lower()
+        assert "goat cheese" in result["note"].lower()
+
+    def test_normal_ingredient_no_false_modifier_strip(self):
+        # "Goat cheese" starts with "Goat" which is NOT in the modifier
+        # list — name shouldn't get clipped.
+        result = parse_ingredient("4 oz goat cheese")
+        assert result["unit"] == "oz"
+        assert result["name"].lower() == "goat cheese"
+
+    def test_post_qty_paren_is_note(self):
+        # "1 (15 oz) can crushed tomatoes" — the "(15 oz)" is a package
+        # size, not part of the name.
+        result = parse_ingredient("1 (15 oz) can crushed tomatoes")
+        assert result["quantity"] == 1.0
+        assert result["unit"] == "can"
+        assert "crushed tomatoes" in result["name"].lower()
+        assert "15 oz" in result["note"]
+
+    def test_post_qty_paren_decimal(self):
+        result = parse_ingredient("2 (14.5 oz) cans diced tomatoes")
+        assert result["quantity"] == 2.0
+        assert result["unit"] == "can"
+        assert "14.5 oz" in result["note"]
+
+    def test_trailing_to_taste(self):
+        result = parse_ingredient("Salt and pepper to taste")
+        assert "salt and pepper" in result["name"].lower()
+        assert "to taste" in result["note"].lower()
+
+    def test_trailing_for_garnish(self):
+        result = parse_ingredient("Fresh parsley for garnish")
+        assert result["name"].lower() == "fresh parsley"
+        assert "for garnish" in result["note"].lower()
+
+    def test_trailing_for_serving(self):
+        result = parse_ingredient("1 lemon, sliced, for serving")
+        assert result["quantity"] == 1.0
+        assert "lemon" in result["name"].lower()
+        # comma-tail picks up "sliced", trailing-qualifier picks up "for serving"
+        assert "sliced" in result["note"].lower()
+        assert "for serving" in result["note"].lower()
+
+    def test_trailing_optional(self):
+        result = parse_ingredient("1 tsp vanilla extract optional")
+        assert result["quantity"] == 1.0
+        assert result["unit"] == "tsp"
+        assert "vanilla extract" in result["name"].lower()
+        assert "optional" in result["note"].lower()
+
+    def test_plus_more_for_dusting(self):
+        result = parse_ingredient("2 cups flour, plus more for dusting")
+        assert result["quantity"] == 2.0
+        assert result["unit"] == "cup"
+        assert "flour" in result["name"].lower()
+        # Either the comma-tail or the trailing-qualifier should catch it
+        assert "more" in result["note"].lower() or "dusting" in result["note"].lower()
+
+    def test_ball_unit_left_in_name(self):
+        # "ball" isn't in our UNIT_ALIASES so the parser leaves it in the
+        # name — acceptable behavior. Locked in by this test so a future
+        # "treat ball as a unit" change is intentional.
+        result = parse_ingredient("1 ball Best Pizza Dough")
+        assert result["quantity"] == 1.0
+        assert result["unit"] == ""
+        assert "ball" in result["name"].lower()
+        assert "pizza dough" in result["name"].lower()
+
+    def test_no_false_qualifier_strip(self):
+        # "for the cake" appears in section headers — make sure we don't
+        # accidentally strip "for X" anywhere mid-string.
+        result = parse_ingredient("4 oz cream cheese")
+        assert result["unit"] == "oz"
+        assert result["name"].lower() == "cream cheese"
+        # "cream cheese" doesn't contain "for serving" etc., so note stays empty
+        assert result["note"] == ""
+
 
 # ---------------------------------------------------------------------------
 # normalize_unit / normalize_name
