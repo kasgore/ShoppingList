@@ -15,26 +15,38 @@ from __future__ import annotations
 
 import sqlite3
 import struct
+import threading
 
 EMBEDDING_DIM = 384
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 _model = None
 _model_load_failed = False
+# Guard the singleton init: with gunicorn 1 worker / 8 threads, two
+# concurrent requests on a cold start can both see _model=None and both
+# try to instantiate the 22 MB model — wasted RAM on the Pi 4.
+_model_lock = threading.Lock()
 
 
 def _load_model():
     """Lazily instantiate the fastembed TextEmbedding model. Cached for
-    the lifetime of the process — model load is ~2-5s on a Pi 5."""
+    the lifetime of the process — model load is ~2-5 s on Pi 5,
+    longer on Pi 4."""
     global _model, _model_load_failed
+    # Fast path: read without lock.
     if _model is not None or _model_load_failed:
         return _model
-    try:
-        from fastembed import TextEmbedding
-        _model = TextEmbedding(EMBEDDING_MODEL)
-    except Exception:
-        _model_load_failed = True
-    return _model
+    with _model_lock:
+        # Double-checked locking: re-read after acquiring the lock so
+        # only the first thread does the actual instantiation.
+        if _model is not None or _model_load_failed:
+            return _model
+        try:
+            from fastembed import TextEmbedding
+            _model = TextEmbedding(EMBEDDING_MODEL)
+        except Exception:
+            _model_load_failed = True
+        return _model
 
 
 def is_available() -> bool:
@@ -128,7 +140,29 @@ def encode(text: str) -> bytes | None:
 def upsert_recipe_embedding(
     conn: sqlite3.Connection, recipe_id: int, text: str
 ) -> bool:
-    """Compute and store/replace an embedding row for the recipe."""
+    """Compute and store/replace an embedding row for the recipe.
+
+    Skips the (relatively expensive) re-encode when the input text hash
+    matches the row already stored in `recipe_embedding_hash` — common
+    case after a recipe edit that only changed the rating or favorite
+    flag. Falls back to a plain upsert if the hash table doesn't exist
+    yet (older deploys, mid-migration).
+    """
+    if not text:
+        return False
+    import hashlib
+    text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    try:
+        existing = conn.execute(
+            "SELECT text_hash FROM recipe_embedding_hash WHERE recipe_id = ?",
+            (recipe_id,),
+        ).fetchone()
+        if existing is not None and existing[0] == text_hash:
+            return True  # text unchanged — keep the existing embedding
+    except sqlite3.OperationalError:
+        # Hash table not present — proceed with a fresh encode.
+        pass
+
     blob = encode(text)
     if blob is None:
         return False
@@ -142,6 +176,14 @@ def upsert_recipe_embedding(
             "INSERT INTO recipe_embedding (recipe_id, embedding) VALUES (?, ?)",
             (recipe_id, blob),
         )
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO recipe_embedding_hash "
+                "(recipe_id, text_hash) VALUES (?, ?)",
+                (recipe_id, text_hash),
+            )
+        except sqlite3.OperationalError:
+            pass  # hash table missing on older builds — non-fatal
         return True
     except Exception:
         return False

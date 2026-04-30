@@ -157,6 +157,16 @@ def _parse_quantity_token(text: str) -> tuple[float | None, str]:
         return None, text
 
 
+# Unicode spaces that arrive from Word / email pastes and break parsing.
+# Vulgar fractions (½ ⅓ ¼ etc.) are preserved deliberately — the regex
+# matches them as single characters.
+#      NO-BREAK SPACE
+#      FIGURE SPACE
+#      THIN SPACE
+#      NARROW NO-BREAK SPACE
+_UNICODE_SPACES_RE = re.compile("[    ]")
+
+
 def parse_ingredient(line: str) -> dict:
     """Parse a free-form ingredient string like '1 1/2 cups flour, sifted'
     into {name, quantity, unit, note}. Best-effort; the user can fix up
@@ -164,6 +174,9 @@ def parse_ingredient(line: str) -> dict:
     original = line.strip()
     if not original:
         return {"name": "", "quantity": 1.0, "unit": "", "note": ""}
+    # Replace odd Unicode space characters with a regular ASCII space so
+    # paste-from-Word strings like "1[NBSP]½ cups" parse cleanly.
+    original = _UNICODE_SPACES_RE.sub(" ", original)
     # Strip a leading bullet/dash decoration from photo OCR or pasted lists.
     # Must happen before quantity parsing — otherwise "- 1 pound" yields no qty.
     original = re.sub(r"^[-*•·–—]+\s*", "", original)

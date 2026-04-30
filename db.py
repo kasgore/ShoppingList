@@ -106,7 +106,29 @@ CREATE TABLE IF NOT EXISTS purchase_history (
 CREATE INDEX IF NOT EXISTS idx_purchase_history_name ON purchase_history(name);
 CREATE INDEX IF NOT EXISTS idx_purchase_history_checked_at
     ON purchase_history(checked_at);
+
+CREATE TABLE IF NOT EXISTS recipe_embedding_hash (
+    -- SHA-1 of the text we last embedded for each recipe. Lets us skip
+    -- the (relatively expensive on Pi 4) re-encode when nothing relevant
+    -- to the embedding changed (e.g. user only updated the rating).
+    recipe_id  INTEGER PRIMARY KEY REFERENCES recipe(id) ON DELETE CASCADE,
+    text_hash  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+    -- Tiny key/value store for app-internal flags. Currently used to
+    -- gate the init_db() reclassification pass on classifier-rule
+    -- version, so a 1000-row DB doesn't pay the SELECT+UPDATE cost on
+    -- every container restart.
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 """
+
+# Bump this whenever the rules in ingredient.guess_category() change.
+# init_db() will re-run the "Other" reclassification on the next start
+# only if the persisted value disagrees with this one.
+CLASSIFIER_VERSION = "1"
 
 
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
@@ -194,20 +216,31 @@ def init_db() -> None:
             conn.commit()
 
         # Re-classify any ingredient or ad-hoc item still sitting in 'Other'
-        # using the latest keyword rules. Safe to run repeatedly: rows that
-        # remain unmatched stay as 'Other'.
-        for table in ("ingredient", "adhoc_item"):
-            rows = conn.execute(
-                f"SELECT id, name FROM {table} WHERE category = 'Other'"
-            ).fetchall()
-            for row in rows:
-                guessed = guess_category(row[1])
-                if guessed != "Other":
-                    conn.execute(
-                        f"UPDATE {table} SET category = ? WHERE id = ?",
-                        (guessed, row[0]),
-                    )
-        conn.commit()
+        # using the latest keyword rules. Skipped on subsequent boots when
+        # the persisted classifier_version matches CLASSIFIER_VERSION, so
+        # a 1000-row DB doesn't pay this cost on every container restart.
+        stored_version_row = conn.execute(
+            "SELECT value FROM app_meta WHERE key = 'classifier_version'"
+        ).fetchone()
+        stored_version = stored_version_row[0] if stored_version_row else ""
+        if stored_version != CLASSIFIER_VERSION:
+            for table in ("ingredient", "adhoc_item"):
+                rows = conn.execute(
+                    f"SELECT id, name FROM {table} WHERE category = 'Other'"
+                ).fetchall()
+                for row in rows:
+                    guessed = guess_category(row[1])
+                    if guessed != "Other":
+                        conn.execute(
+                            f"UPDATE {table} SET category = ? WHERE id = ?",
+                            (guessed, row[0]),
+                        )
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta (key, value) "
+                "VALUES ('classifier_version', ?)",
+                (CLASSIFIER_VERSION,),
+            )
+            conn.commit()
 
         # Best-effort: create the vec0 virtual table for semantic search
         # and backfill embeddings for any recipes that don't have one.

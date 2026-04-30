@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import zipfile
@@ -259,20 +260,29 @@ def _is_valid_kasa_db(path: str) -> bool:
 def _write_full_backup_zip(zip_path: str) -> tuple[int, int]:
     """Snapshot DB + uploaded photos into a ZIP at `zip_path`.
 
-    Returns (photo_count, total_bytes). Raises on failure. The DB is
-    written via SQLite's Online Backup API so the snapshot is consistent
-    even if a write is in flight when the user clicks Download.
+    Returns (photo_count, total_bytes). Raises on failure.
+
+    The DB is captured via `VACUUM INTO` rather than `Connection.backup()`
+    so the snapshot is both consistent AND defragmented. For a database
+    that's seen lots of UPDATEs/DELETEs this typically yields a backup
+    that's 20–30 % smaller than a raw-page copy. VACUUM INTO requires
+    that the destination file does not exist, so we remove the empty
+    file mkstemp creates before invoking it.
     """
     fd, tmp_db = tempfile.mkstemp(suffix=".db", prefix="kasa-snap-")
     os.close(fd)
+    try:
+        os.remove(tmp_db)
+    except OSError:
+        pass
     photo_count = 0
     total_bytes = 0
     try:
         src = sqlite3.connect(DB_PATH)
-        dst = sqlite3.connect(tmp_db)
-        src.backup(dst)
-        dst.close()
-        src.close()
+        try:
+            src.execute("VACUUM INTO ?", (tmp_db,))
+        finally:
+            src.close()
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(tmp_db, arcname="shoppinglist.db")
             if os.path.isdir(UPLOAD_DIR):
@@ -375,6 +385,13 @@ def _get_recipe(recipe_id: int):
 _sse_subscribers: "set[queue.Queue]" = set()
 _sse_lock = threading.Lock()
 
+# Serializes the DELETE+INSERT pair inside _save_recipe so concurrent
+# edits from two family devices can't interleave and lose one user's
+# ingredient inserts. With gunicorn 1 worker / 8 threads, an in-process
+# lock is sufficient. Family-scale write contention is rare; the lock
+# is held for ~50-200 ms per save.
+_recipe_save_lock = threading.Lock()
+
 
 def _broadcast(event_type: str, data: str = "1") -> None:
     """Push an event to every subscriber. Best-effort — full queues are
@@ -443,7 +460,9 @@ def _refresh_recipe_embedding(db, recipe_id: int) -> None:
 
     Best-effort — silently skipped if fastembed/sqlite-vec aren't
     installed or aren't usable on this build. Called from the recipe
-    save handler and the URL/photo import flows.
+    save handler and the URL/photo import flows. The embedding module
+    handles input-text hash deduplication internally so editing only
+    the rating doesn't burn Pi 4 CPU on every save.
     """
     try:
         import embedding as _embedding
@@ -508,6 +527,33 @@ def _delete_uploaded_image_file(
         return False
 
 
+def _rotate_pre_restore_snapshots(keep: int = 5) -> None:
+    """Keep at most `keep` most-recent pre-restore-*.{db,zip} snapshots
+    next to the DB. Older ones are removed so /data doesn't grow forever.
+    """
+    db_dir = os.path.dirname(DB_PATH)
+    if not os.path.isdir(db_dir):
+        return
+    snapshots: list[tuple[float, str]] = []
+    for fname in os.listdir(db_dir):
+        if not fname.startswith("pre-restore-"):
+            continue
+        if not (fname.endswith(".db") or fname.endswith(".zip")):
+            continue
+        full = os.path.join(db_dir, fname)
+        try:
+            snapshots.append((os.path.getmtime(full), full))
+        except OSError:
+            pass
+    # Newest first; keep the head, delete the rest.
+    snapshots.sort(reverse=True)
+    for _, full in snapshots[keep:]:
+        try:
+            os.remove(full)
+        except OSError:
+            pass
+
+
 def _scan_orphan_images() -> list[str]:
     """Return basenames in UPLOAD_DIR that no recipe.image_url references."""
     if not os.path.isdir(UPLOAD_DIR):
@@ -563,7 +609,39 @@ def _save_uploaded_image(file_storage) -> str | None:
     if os.path.getsize(dest) > MAX_UPLOAD_BYTES:
         os.remove(dest)
         raise ValueError("Image is too large (max 8 MB).")
+    _strip_image_metadata(dest)
     return f"/static/uploads/{safe}"
+
+
+def _strip_image_metadata(path: str) -> None:
+    """Re-encode an uploaded image without EXIF metadata.
+
+    Phone-taken recipe photos carry GPS coordinates of the family's home;
+    stripping on upload prevents that data from showing up in any backup
+    ZIP, browser cache, or restored copy. Best-effort — non-image files
+    or formats Pillow can't re-encode are silently skipped (the file
+    stays on disk untouched).
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return
+    try:
+        with Image.open(path) as img:
+            fmt = img.format
+            if fmt is None:
+                return
+            # Decode the pixel data into a fresh Image with no metadata.
+            img.load()
+            stripped = img.copy()
+        # Pillow's save() does not include EXIF unless explicitly passed
+        # via the `exif` kwarg, so a plain re-save drops it.
+        stripped.save(path, format=fmt)
+    except Exception:
+        # Anything went wrong — leave the original file in place. The
+        # photo still works as a recipe image; we just couldn't strip
+        # metadata on this one.
+        pass
 
 
 def _resolve_secret_key() -> str:
@@ -779,14 +857,25 @@ def create_app() -> Flask:
             ).fetchall()
         ]
 
-        recipes = []
-        for r in rows:
-            ings = db.execute(
-                "SELECT id, name, quantity, unit, category, note "
-                "FROM ingredient WHERE recipe_id = ? ORDER BY id",
-                (r["id"],),
+        # Fetch all ingredients for the displayed recipes in ONE query
+        # rather than firing per-recipe queries (N+1). Significant for the
+        # Pi 4 when the recipe library grows past ~30 recipes.
+        ings_by_recipe: dict[int, list] = defaultdict(list)
+        recipe_ids = [r["id"] for r in rows]
+        if recipe_ids:
+            placeholders = ",".join("?" * len(recipe_ids))
+            ing_rows = db.execute(
+                "SELECT id, recipe_id, name, quantity, unit, category, note "
+                f"FROM ingredient WHERE recipe_id IN ({placeholders}) "
+                "ORDER BY recipe_id, id",
+                recipe_ids,
             ).fetchall()
-            recipes.append({"recipe": r, "ingredients": ings})
+            for ing in ing_rows:
+                ings_by_recipe[ing["recipe_id"]].append(ing)
+        recipes = [
+            {"recipe": r, "ingredients": ings_by_recipe.get(r["id"], [])}
+            for r in rows
+        ]
         return render_template(
             "recipes.html",
             recipes=recipes,
@@ -1499,8 +1588,10 @@ def create_app() -> Flask:
         )
         file.save(incoming)
 
-        # Always snapshot current state before touching anything.
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        # Always snapshot current state before touching anything. Include
+        # microseconds in the filename so two same-second restores don't
+        # overwrite each other's pre-restore snapshots.
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         pre_path = os.path.join(db_dir, f"pre-restore-{ts}.zip")
         try:
             _write_full_backup_zip(pre_path)
@@ -1511,6 +1602,7 @@ def create_app() -> Flask:
                 pass
             flash(f"Couldn't snapshot current state; aborting: {exc}", "error")
             return redirect(url_for("backup_page"))
+        _rotate_pre_restore_snapshots(keep=5)
 
         # Branch on file type.
         if ext == ".zip":
@@ -1596,8 +1688,10 @@ def create_app() -> Flask:
             "(use a .zip backup to also restore photos)."
         )
 
+    # Optional `-NNNNNN` microsecond suffix accepted for newer snapshots
+    # while still allowing the older second-precision filenames.
     _SNAPSHOT_NAME_RE = re.compile(
-        r"pre-restore-[0-9]{8}-[0-9]{6}\.(?:db|zip)"
+        r"pre-restore-[0-9]{8}-[0-9]{6}(?:-[0-9]{6})?\.(?:db|zip)"
     )
 
     @app.get("/backup/snapshot/<name>")
@@ -1636,10 +1730,12 @@ def create_app() -> Flask:
         recipe_id = request.form.get("recipe_id", type=int)
         multiplier_raw = request.form.get("multiplier", "1")
         added_by = request.form.get("added_by", "").strip()
-        multiplier = int(
-            _parse_multiplier_field(
-                multiplier_raw, allow_float=False, floor=1, cap=MAX_MULTIPLIER
-            )
+        # Float multiplier preserves "1.5×" / "0.5×" intent. The
+        # list_recipe.multiplier column is REAL; floats are stored
+        # as-given and used downstream when aggregating ingredient
+        # quantities for the shopping list.
+        multiplier = _parse_multiplier_field(
+            multiplier_raw, allow_float=True, floor=0.25, cap=MAX_MULTIPLIER
         )
         db = get_db()
         recipe = db.execute(
@@ -1673,14 +1769,18 @@ def create_app() -> Flask:
         if not name:
             flash("Item name is required.", "error")
             return redirect(url_for("index", _anchor="list"))
-        qty = int(
-            _parse_multiplier_field(
-                request.form.get("quantity"),
-                allow_float=False,
-                floor=1,
-                cap=MAX_QUANTITY,
-            )
-        )
+        # Explicitly reject 0 / negative quantities instead of silently
+        # clamping to 1 — otherwise the user thinks they typed something
+        # and the system disagreed.
+        quantity_raw = (request.form.get("quantity", "1") or "1").strip()
+        try:
+            qty_int = int(float(quantity_raw))
+        except ValueError:
+            qty_int = 1
+        if qty_int <= 0:
+            flash("Quantity must be 1 or more.", "error")
+            return redirect(url_for("index", _anchor="list"))
+        qty = min(MAX_QUANTITY, qty_int)
         unit = request.form.get("unit", "").strip()
         # Aisle is auto-classified from the item name. Falls back to "Other"
         # for things the keyword classifier doesn't recognize.
@@ -1790,75 +1890,80 @@ def create_app() -> Flask:
             servings = 4
 
         db = get_db()
-        # Capture the existing image_url before UPDATE so we can clean up
-        # the old uploaded file if the user replaced it.
+        # Hold the lock across the recipe UPDATE + ingredient DELETE +
+        # ingredient re-INSERT so a second request from another family
+        # device can't interleave and lose ingredients. The lock is
+        # in-process; safe because gunicorn runs 1 worker / 8 threads.
         old_image_url = ""
-        if recipe_id is not None:
-            old_row = db.execute(
-                "SELECT image_url FROM recipe WHERE id = ?", (recipe_id,)
-            ).fetchone()
-            if old_row:
-                old_image_url = old_row["image_url"] or ""
-        try:
-            if recipe_id is None:
-                cur = db.execute(
-                    "INSERT INTO recipe (name, description, servings, instructions, "
-                    "source_url, image_url, prep_time, cook_time, total_time, "
-                    "category, notes, rating) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        name, description, servings, instructions, source_url,
-                        image_url, prep_time, cook_time, total_time,
-                        category_field, notes, rating,
-                    ),
-                )
-                recipe_id = cur.lastrowid
-            else:
-                db.execute(
-                    "UPDATE recipe SET name = ?, description = ?, servings = ?, "
-                    "instructions = ?, source_url = ?, image_url = ?, "
-                    "prep_time = ?, cook_time = ?, total_time = ?, "
-                    "category = ?, notes = ?, rating = ? WHERE id = ?",
-                    (
-                        name, description, servings, instructions, source_url,
-                        image_url, prep_time, cook_time, total_time,
-                        category_field, notes, rating, recipe_id,
-                    ),
-                )
-                db.execute("DELETE FROM ingredient WHERE recipe_id = ?", (recipe_id,))
-        except sqlite3.IntegrityError:
-            flash("A recipe with that name already exists.", "error")
-            return redirect(request.referrer or url_for("recipes_page"))
-
-        names = request.form.getlist("ing_name[]")
-        qtys = request.form.getlist("ing_qty[]")
-        units = request.form.getlist("ing_unit[]")
-        cats = request.form.getlist("ing_cat[]")
-        notes = request.form.getlist("ing_note[]")
-        for i, n in enumerate(names):
-            n = (n or "").strip()
-            if not n:
-                continue
+        with _recipe_save_lock:
+            if recipe_id is not None:
+                old_row = db.execute(
+                    "SELECT image_url FROM recipe WHERE id = ?", (recipe_id,)
+                ).fetchone()
+                if old_row:
+                    old_image_url = old_row["image_url"] or ""
             try:
-                q = float((qtys[i] if i < len(qtys) else "1").strip() or 1)
-                if q <= 0:
+                if recipe_id is None:
+                    cur = db.execute(
+                        "INSERT INTO recipe (name, description, servings, instructions, "
+                        "source_url, image_url, prep_time, cook_time, total_time, "
+                        "category, notes, rating) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            name, description, servings, instructions, source_url,
+                            image_url, prep_time, cook_time, total_time,
+                            category_field, notes, rating,
+                        ),
+                    )
+                    recipe_id = cur.lastrowid
+                else:
+                    db.execute(
+                        "UPDATE recipe SET name = ?, description = ?, servings = ?, "
+                        "instructions = ?, source_url = ?, image_url = ?, "
+                        "prep_time = ?, cook_time = ?, total_time = ?, "
+                        "category = ?, notes = ?, rating = ? WHERE id = ?",
+                        (
+                            name, description, servings, instructions, source_url,
+                            image_url, prep_time, cook_time, total_time,
+                            category_field, notes, rating, recipe_id,
+                        ),
+                    )
+                    db.execute("DELETE FROM ingredient WHERE recipe_id = ?", (recipe_id,))
+            except sqlite3.IntegrityError:
+                db.rollback()
+                flash("A recipe with that name already exists.", "error")
+                return redirect(request.referrer or url_for("recipes_page"))
+
+            names = request.form.getlist("ing_name[]")
+            qtys = request.form.getlist("ing_qty[]")
+            units = request.form.getlist("ing_unit[]")
+            cats = request.form.getlist("ing_cat[]")
+            notes = request.form.getlist("ing_note[]")
+            for i, n in enumerate(names):
+                n = (n or "").strip()
+                if not n:
+                    continue
+                try:
+                    q = float((qtys[i] if i < len(qtys) else "1").strip() or 1)
+                    if q <= 0:
+                        q = 1.0
+                except ValueError:
                     q = 1.0
-            except ValueError:
-                q = 1.0
-            u = (units[i] if i < len(units) else "").strip()
-            # Aisle is auto-derived from the ingredient name unless the form
-            # explicitly supplies one (e.g., legacy data, future overrides).
-            submitted_cat = (cats[i] if i < len(cats) else "").strip()
-            c = submitted_cat or guess_category(n)
-            note = (notes[i] if i < len(notes) else "").strip()
-            db.execute(
-                "INSERT INTO ingredient (recipe_id, name, quantity, unit, category, note) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (recipe_id, n, q, u, c, note),
-            )
-        db.commit()
-        _refresh_recipe_embedding(db, recipe_id)
-        db.commit()
+                u = (units[i] if i < len(units) else "").strip()
+                # Aisle is auto-derived from the ingredient name unless the form
+                # explicitly supplies one (e.g., legacy data, future overrides).
+                submitted_cat = (cats[i] if i < len(cats) else "").strip()
+                c = submitted_cat or guess_category(n)
+                note = (notes[i] if i < len(notes) else "").strip()
+                db.execute(
+                    "INSERT INTO ingredient (recipe_id, name, quantity, unit, category, note) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (recipe_id, n, q, u, c, note),
+                )
+            db.commit()
+            _refresh_recipe_embedding(db, recipe_id)
+            db.commit()
+
         # If the user replaced the image (or removed it), unlink the old
         # uploaded file from disk so we don't accumulate orphans.
         if old_image_url and old_image_url != image_url:
