@@ -31,7 +31,7 @@
         <button type="button" class="scale-btn" data-factor="2">2×</button>
         <button type="button" class="scale-btn" data-factor="3">3×</button>
         <label class="scale-custom-wrap">×
-          <input type="number" class="scale-custom" min="0.1" step="0.1"
+          <input type="number" class="scale-custom" min="0.25" step="0.25"
                  inputmode="decimal" placeholder="N" aria-label="Custom scale">
         </label>
       </div>
@@ -61,10 +61,23 @@
       </p>
     </div>
     <div class="actions">
+      {# Uses whatever scale is dialed in via .scale-controls (JS keeps the
+         hidden multiplier in sync). .add-list-form makes it POST in the
+         background and show "✓ Added" on the button. #}
+      <form action="{{ url_for('list_add_recipe') }}" method="post"
+            class="inline add-list-form">
+        <input type="hidden" name="recipe_id" value="{{ recipe.id }}">
+        <input type="hidden" name="multiplier" value="1" id="scale-add-multiplier">
+        <button type="submit" class="button primary add-list-btn">Add to list</button>
+      </form>
       <a href="{{ url_for('recipe_cook', recipe_id=recipe.id) }}"
-         class="button primary">Cook ⚡</a>
+         class="button">Cook ⚡</a>
       <button onclick="window.print()" class="button" type="button">Print</button>
       <a href="{{ url_for('recipe_edit', recipe_id=recipe.id) }}" class="button">Edit</a>
+      <form action="{{ url_for('recipe_duplicate', recipe_id=recipe.id) }}"
+            method="post" class="inline">
+        <button type="submit" class="button">Duplicate</button>
+      </form>
       <a href="{{ url_for('recipes_page') }}" class="button">All recipes</a>
     </div>
   </header>

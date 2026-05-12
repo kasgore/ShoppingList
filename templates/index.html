@@ -116,6 +116,11 @@
                 aria-label="Shopping progress"></progress>
     </div>
     <div class="actions">
+      <button type="button" id="copy-list-btn" class="button">Copy list</button>
+      {% if has_pantry %}
+        <button type="button" id="hide-pantry-toggle" class="button"
+                aria-pressed="false">Hide pantry</button>
+      {% endif %}
       <button type="button" id="hide-checked-toggle" class="button"
               aria-pressed="false">Hide checked</button>
       <form action="{{ url_for('list_clear') }}" method="post" class="js-list-mutate"
@@ -135,7 +140,7 @@
       <h3 class="cat">{{ category }}</h3>
       <ul class="items">
         {% for item in items %}
-          <li class="item {% if item.checked %}checked{% endif %}" data-key="{{ item.key }}">
+          <li class="item {% if item.checked %}checked{% endif %}{% if item.in_pantry %} pantry{% endif %}" data-key="{{ item.key }}">
             <label class="check">
               <input type="checkbox" class="toggle" {% if item.checked %}checked{% endif %}>
               <span class="qty">
@@ -143,6 +148,7 @@
                 {% if item.unit %}{{ item.unit }}{% endif %}
               </span>
               <span class="name">{{ item.name }}</span>
+              {% if item.in_pantry %}<span class="pantry-tag" title="In your pantry — you probably already have this">🏠</span>{% endif %}
               {% if item.note %}<span class="note">— {{ item.note }}</span>{% endif %}
               <span class="sources">{{ item.sources|join(', ') }}</span>
             </label>

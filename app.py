@@ -88,6 +88,7 @@ class AggregatedItem:
     is_adhoc: bool = False
     adhoc_id: int | None = None
     checked: bool = False
+    in_pantry: bool = False
 
     @property
     def display_quantity(self) -> str:
@@ -205,15 +206,23 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
     checked_keys = {
         row["key"] for row in db.execute("SELECT key FROM checked_item").fetchall()
     }
+    # Flag recipe-derived items the family keeps stocked (the pantry). Ad-hoc
+    # adds are never auto-flagged — you asked for it, so presumably you need it.
+    pantry_norms = {
+        row[0] for row in db.execute("SELECT normalized FROM pantry_item").fetchall()
+    }
     for item in bucket.values():
         item.checked = item.key in checked_keys
+        if not item.is_adhoc and pantry_norms:
+            item.in_pantry = normalize_name(item.name) in pantry_norms
 
-    # Group by category, preserving the configured order.
+    # Group by category, preserving the configured order. Within a category:
+    # unchecked-not-pantry first, then pantry staples, then checked items.
     grouped: dict[str, list[AggregatedItem]] = defaultdict(list)
     for item in bucket.values():
         grouped[item.category].append(item)
     for items in grouped.values():
-        items.sort(key=lambda i: (i.checked, i.name))
+        items.sort(key=lambda i: (i.checked, i.in_pantry, i.name))
 
     ordered: dict[str, list[AggregatedItem]] = {}
     for cat in CATEGORIES:
@@ -1336,6 +1345,7 @@ def create_app() -> Flask:
         total_items = sum(len(v) for v in grouped.values())
         checked_count = sum(1 for items in grouped.values() for i in items if i.checked)
         quick_add = _top_predicted_items_cached(db, limit=8)
+        has_pantry = db.execute("SELECT COUNT(*) FROM pantry_item").fetchone()[0] > 0
         return render_template(
             "index.html",
             recipes=recipes,
@@ -1345,6 +1355,7 @@ def create_app() -> Flask:
             total_items=total_items,
             checked_count=checked_count,
             quick_add=quick_add,
+            has_pantry=has_pantry,
         )
 
     @app.route("/recipes")
@@ -1979,6 +1990,115 @@ def create_app() -> Flask:
         _list_changed()
         flash("Recipe deleted.", "success")
         return redirect(url_for("recipes_page"))
+
+    @app.route("/recipes/<int:recipe_id>/duplicate", methods=["POST"])
+    def recipe_duplicate(recipe_id: int):
+        """Save a copy of a recipe (+ its ingredients) under a new name
+        and drop the user on its edit page to tweak the variant. The copy
+        shares the original's uploaded image file — _delete_uploaded_image_file
+        already refuses to remove a file another recipe still references."""
+        db = get_db()
+        src = db.execute(
+            f"SELECT {_RECIPE_FETCH_COLUMNS} FROM recipe WHERE id = ?",
+            (recipe_id,),
+        ).fetchone()
+        if src is None:
+            flash("Recipe not found.", "error")
+            return redirect(url_for("recipes_page"))
+        base_name = f"{src['name']} (copy)"
+        name = base_name
+        n = 2
+        while db.execute("SELECT 1 FROM recipe WHERE name = ?", (name,)).fetchone():
+            name = f"{base_name} {n}"
+            n += 1
+        cur = db.execute(
+            "INSERT INTO recipe (name, description, servings, instructions, "
+            "source_url, image_url, prep_time, cook_time, total_time, category, "
+            "notes, is_favorite, rating, nutrition, yields_text, cuisine, author, "
+            "source_rating, keywords) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                name, src["description"], src["servings"], src["instructions"],
+                src["source_url"], src["image_url"], src["prep_time"],
+                src["cook_time"], src["total_time"], src["category"], src["notes"],
+                src["is_favorite"], src["rating"], src["nutrition"],
+                src["yields_text"], src["cuisine"], src["author"],
+                src["source_rating"], src["keywords"],
+            ),
+        )
+        new_id = cur.lastrowid
+        for ing in db.execute(
+            "SELECT name, quantity, unit, category, note FROM ingredient "
+            "WHERE recipe_id = ? ORDER BY id",
+            (recipe_id,),
+        ).fetchall():
+            db.execute(
+                "INSERT INTO ingredient (recipe_id, name, quantity, unit, "
+                "category, note) VALUES (?, ?, ?, ?, ?, ?)",
+                (new_id, ing["name"], ing["quantity"], ing["unit"],
+                 ing["category"], ing["note"]),
+            )
+        db.commit()
+        _refresh_recipe_embedding(db, new_id)
+        db.commit()
+        flash(f'Duplicated as "{name}" — tweak it below.', "success")
+        return redirect(url_for("recipe_edit", recipe_id=new_id))
+
+    # ---- Pantry --------------------------------------------------------
+
+    @app.route("/pantry")
+    def pantry_page():
+        db = get_db()
+        items = db.execute(
+            "SELECT id, name FROM pantry_item ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        pantry_norms = {normalize_name(r["name"]) for r in items}
+        # Recipe-derived names currently on the shopping list that aren't
+        # pantry staples yet — surface them as one-tap "add to pantry".
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for cat_items in build_shopping_list(db).values():
+            for it in cat_items:
+                if it.is_adhoc:
+                    continue
+                norm = normalize_name(it.name)
+                if norm in pantry_norms or norm in seen:
+                    continue
+                seen.add(norm)
+                candidates.append(it.name)
+        candidates.sort(key=str.lower)
+        return render_template("pantry.html", items=items, candidates=candidates)
+
+    @app.post("/pantry/add")
+    def pantry_add():
+        name = request.form.get("name", "").strip()
+        if not name:
+            flash("Item name is required.", "error")
+            return redirect(url_for("pantry_page"))
+        norm = normalize_name(name)
+        db = get_db()
+        if db.execute(
+            "SELECT 1 FROM pantry_item WHERE normalized = ?", (norm,)
+        ).fetchone():
+            flash(f"{name} is already in your pantry.", "error")
+            return redirect(url_for("pantry_page"))
+        db.execute(
+            "INSERT INTO pantry_item (name, normalized) VALUES (?, ?)",
+            (name, norm),
+        )
+        db.commit()
+        _list_changed()   # pantry flags on the shopping list change
+        flash(f"Added {name} to your pantry.", "success")
+        return redirect(url_for("pantry_page"))
+
+    @app.post("/pantry/<int:item_id>/delete")
+    def pantry_delete(item_id: int):
+        db = get_db()
+        db.execute("DELETE FROM pantry_item WHERE id = ?", (item_id,))
+        db.commit()
+        _list_changed()
+        flash("Removed from pantry.", "success")
+        return redirect(url_for("pantry_page"))
 
     # ---- Shopping list actions -----------------------------------------
 

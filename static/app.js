@@ -425,6 +425,8 @@ function kasaFormatQty(qty) {
   const servesNum = document.querySelector(".serves-num[data-base]");
   const servesScaled = document.querySelector(".serves-scaled");
   const custom = controls.querySelector(".scale-custom");
+  // The "Add to list" form on this page sends this as the multiplier.
+  const addMultInput = document.getElementById("scale-add-multiplier");
 
   function applyFactor(factor) {
     factor = (isFinite(factor) && factor > 0) ? factor : 1;
@@ -453,6 +455,7 @@ function kasaFormatQty(qty) {
       if (on) matchedBtn = true;
     });
     if (custom && matchedBtn && document.activeElement !== custom) custom.value = "";
+    if (addMultInput) addMultInput.value = String(factor);
   }
 
   controls.querySelectorAll(".scale-btn").forEach((b) => {
@@ -464,6 +467,102 @@ function kasaFormatQty(qty) {
       applyFactor(isFinite(v) && v > 0 ? v : 1);
     });
   }
+})();
+
+// ---------------------------------------------------------------------
+// "Hide pantry" toggle — collapses recipe staples you keep stocked.
+// Default ON (the pantry feature only does anything once you've added
+// staples, and once you have, collapsing them is the point).
+// ---------------------------------------------------------------------
+(function setupHidePantry() {
+  const KEY = "shoppinglist:hidePantry";
+  const list = document.getElementById("list");
+  const btn = document.getElementById("hide-pantry-toggle");
+  if (!list || !btn) return;
+  function apply(on) {
+    list.classList.toggle("hide-pantry", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+  let on = true;
+  try { on = localStorage.getItem(KEY) !== "0"; } catch (e) {}
+  apply(on);
+  btn.addEventListener("click", () => {
+    on = !list.classList.contains("hide-pantry");
+    apply(on);
+    try { localStorage.setItem(KEY, on ? "1" : "0"); } catch (e) {}
+  });
+})();
+
+// ---------------------------------------------------------------------
+// "Copy list" — plain-text shopping list to the clipboard (or share /
+// prompt fallback for plain-HTTP contexts where the Clipboard API is
+// unavailable).
+// ---------------------------------------------------------------------
+function buildShoppingListText() {
+  const list = document.getElementById("list");
+  const hidePantry = !!(list && list.classList.contains("hide-pantry"));
+  const out = [];
+  document.querySelectorAll("#list-body .cat-section").forEach((sec) => {
+    const cat = (sec.querySelector(".cat") || {}).textContent || "";
+    const rows = [];
+    sec.querySelectorAll(".item").forEach((li) => {
+      if (li.classList.contains("checked")) return;
+      if (hidePantry && li.classList.contains("pantry")) return;
+      const qty = ((li.querySelector(".qty") || {}).textContent || "").replace(/\s+/g, " ").trim();
+      const name = ((li.querySelector(".name") || {}).textContent || "").trim();
+      const note = ((li.querySelector(".note") || {}).textContent || "").trim();
+      let line = "- " + (qty ? qty + " " : "") + name;
+      if (note) line += " " + note;   // note already starts with "— "
+      rows.push(line);
+    });
+    if (rows.length) {
+      out.push(cat.trim() + ":");
+      out.push.apply(out, rows);
+      out.push("");
+    }
+  });
+  return out.join("\n").trim();
+}
+
+async function copyTextToClipboard(text) {
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* fall through */ }
+  }
+  // Legacy path — works over plain HTTP, unlike the Clipboard API.
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (ok) return true;
+  } catch (e) { /* fall through */ }
+  return false;
+}
+
+function flashOnButton(btn, msg) {
+  if (!btn._origLabel) btn._origLabel = btn.textContent;
+  btn.textContent = msg;
+  btn.disabled = true;
+  setTimeout(() => { btn.textContent = btn._origLabel; btn.disabled = false; }, 1500);
+}
+
+(function setupCopyList() {
+  const btn = document.getElementById("copy-list-btn");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const text = buildShoppingListText();
+    if (!text) { flashOnButton(btn, "Nothing to copy"); return; }
+    if (await copyTextToClipboard(text)) { flashOnButton(btn, "Copied!"); return; }
+    // Last resort: a prompt the user can copy out of manually.
+    try { window.prompt("Shopping list — copy this:", text); } catch (e) {}
+  });
 })();
 
 // Recipe form: pressing Enter in an ingredient name field adds a new row

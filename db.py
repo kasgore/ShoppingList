@@ -111,6 +111,20 @@ CREATE INDEX IF NOT EXISTS idx_purchase_history_name ON purchase_history(name);
 CREATE INDEX IF NOT EXISTS idx_purchase_history_checked_at
     ON purchase_history(checked_at);
 
+CREATE TABLE IF NOT EXISTS pantry_item (
+    -- Staples the family normally keeps stocked. When a recipe pushes
+    -- one of these onto the shopping list, build_shopping_list flags it
+    -- "probably have it" so the UI can collapse it — keeps salt/oil/
+    -- flour from cluttering the list on every recipe. `normalized` is
+    -- ingredient.normalize_name(name), matched against the normalized
+    -- recipe-ingredient names.
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    normalized  TEXT    NOT NULL,
+    added_at    TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_pantry_normalized ON pantry_item(normalized);
+
 CREATE TABLE IF NOT EXISTS recipe_embedding_hash (
     -- SHA-1 of the text we last embedded for each recipe. Lets us skip
     -- the (relatively expensive on Pi 4) re-encode when nothing relevant

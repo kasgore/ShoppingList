@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Pantry · Kasa{% endblock %}
+
+{% block content %}
+<section class="card">
+  <header class="list-header">
+    <div>
+      <h2>Pantry</h2>
+      <p class="muted">
+        Staples you normally keep stocked. When a recipe needs one of these,
+        it's marked “probably have it” on your shopping list — so salt, oil, and
+        flour don't clutter every list. (Toggle “Hide pantry” on the shopping
+        list to collapse them.)
+      </p>
+    </div>
+  </header>
+
+  <form action="{{ url_for('pantry_add') }}" method="post" class="row">
+    <label class="grow">
+      <span>Add a staple</span>
+      <input type="text" name="name" required placeholder="e.g., Olive oil">
+    </label>
+    <button type="submit" class="button primary">Add</button>
+  </form>
+
+  {% if items %}
+    <ul class="chip-list">
+      {% for it in items %}
+      <li>
+        <span><strong>{{ it.name }}</strong></span>
+        <form action="{{ url_for('pantry_delete', item_id=it.id) }}"
+              method="post" class="inline">
+          <button class="link" title="Remove">×</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">No pantry staples yet — add the things you always have on hand.</p>
+  {% endif %}
+
+  {% if candidates %}
+    <h3>On your shopping list right now</h3>
+    <p class="muted small-note">
+      One-tap add — these are recipe ingredients currently on the list that
+      aren't pantry staples yet.
+    </p>
+    <ul class="quick-add-chips">
+      {% for name in candidates %}
+        <li>
+          <form action="{{ url_for('pantry_add') }}" method="post" class="inline">
+            <input type="hidden" name="name" value="{{ name }}">
+            <button type="submit" class="chip-btn" title="Add {{ name }} to pantry">
+              + {{ name }}
+            </button>
+          </form>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}

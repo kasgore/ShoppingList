@@ -1037,17 +1037,30 @@ code {
 .list-progress::-moz-progress-bar { background: var(--accent); }
 .list-progress[value="0"] { opacity: .45; }
 
-#hide-checked-toggle[aria-pressed="true"] {
+#hide-checked-toggle[aria-pressed="true"],
+#hide-pantry-toggle[aria-pressed="true"] {
   background: var(--accent);
   color: var(--accent-ink);
   border-color: var(--accent);
 }
 
-/* When hide-checked is on, drop checked items and any category section
-   that has no unchecked items left. (:has() is supported in all current
-   mobile browsers — Safari 15.4+.) */
+/* "Probably have it" recipe staples — dimmed, with a little house tag. */
+.item.pantry .name { color: var(--muted); }
+.pantry-tag {
+  font-size: .85em;
+  opacity: .75;
+  flex: 0 0 auto;
+  align-self: center;
+  cursor: help;
+}
+
+/* Hide checked / pantry items, and a category section once everything in
+   it would be hidden. (:has() — Safari 15.4+, Chrome 105+.) */
 #list.hide-checked .item.checked { display: none; }
-#list.hide-checked .cat-section:not(:has(.item:not(.checked))) { display: none; }
+#list.hide-pantry .item.pantry { display: none; }
+#list.hide-checked:not(.hide-pantry) .cat-section:not(:has(.item:not(.checked))) { display: none; }
+#list.hide-pantry:not(.hide-checked) .cat-section:not(:has(.item:not(.pantry))) { display: none; }
+#list.hide-checked.hide-pantry .cat-section:not(:has(.item:not(.checked):not(.pantry))) { display: none; }
 
 /* --- Flash messages: auto-fade ------------------------------------- */
 /* #flashes is always in the DOM (so AJAX handlers can swap fresh
