@@ -51,15 +51,16 @@
     <a href="{{ url_for('backup_page') }}">Backup</a>
   </nav>
 
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-      <div class="flashes">
-        {% for category, msg in messages %}
-          <div class="flash flash-{{ category }}">{{ msg }}</div>
-        {% endfor %}
-      </div>
-    {% endif %}
-  {% endwith %}
+  {# Always rendered (even when empty) so the AJAX list-mutation handlers
+     can swap fresh flash messages in via id. `.flashes:empty` is hidden
+     in CSS so an empty wrapper takes no space. #}
+  <div class="flashes" id="flashes">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, msg in messages %}
+        <div class="flash flash-{{ category }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+  </div>
 
   <main>
     {% block content %}{% endblock %}

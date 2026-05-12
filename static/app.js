@@ -7,6 +7,22 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+// ---------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------
+
+// Per-page-load id. Sent on every list-mutation request via X-Client-Id
+// so the SSE stream can tell this tab to ignore its own echoed event
+// (we already updated the DOM optimistically when we made the change).
+const KASA_CLIENT_ID = (() => {
+  try { return crypto.randomUUID(); }
+  catch (e) { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+})();
+
+function isHomePath() {
+  return location.pathname === "/" || location.pathname === "/index" || location.pathname === "";
+}
+
 // Cook Mode: full-screen step-by-step recipe view with Wake Lock so the
 // screen stays on while hands are messy. Wake Lock is stable on iOS 16.4+
 // in installed PWAs and Chrome Android since 2021. Falls back gracefully
@@ -28,6 +44,13 @@ if ("serviceWorker" in navigator) {
 
   function render() {
     stepText.textContent = steps[current];
+    // Re-annotate this step's text for tappable timers. textContent was
+    // just replaced, so clear the "already done" marker first. The timer
+    // module sets window.__kasaAnnotateTimers once it has run; for the
+    // very first render (before that) the timer module's own DOM-ready
+    // pass handles #cook-step-text.
+    delete stepText.dataset.timersDone;
+    if (window.__kasaAnnotateTimers) window.__kasaAnnotateTimers(stepText);
     counter.textContent = String(current + 1);
     progress.value = current + 1;
     prevBtn.disabled = current === 0;
@@ -101,37 +124,112 @@ if ("serviceWorker" in navigator) {
   render();
 })();
 
-// Real-time list sync: open an EventSource on the home page so when one
-// family member checks an item off (or adds one) every other phone
-// updates within a second. Reload is debounced + skipped while the user
-// is actively typing or the page is hidden, to avoid clobbering their work.
+// ---------------------------------------------------------------------
+// Real-time list sync + AJAX list mutations.
+//
+// When the shopping list changes — from another device, or from one of
+// our own .js-list-mutate forms — we patch just the affected regions of
+// the home page in place (#list-body, #quick-add-region, #on-list-region).
+// No full reload, so scroll position and anything half-typed in the cards
+// above survive. Events echoed back from *this* tab's own changes are
+// ignored (we already updated the DOM optimistically).
+// ---------------------------------------------------------------------
+
+// Swap the home-page list regions from a freshly-rendered "/" document.
+// Returns false if the HTML doesn't look like the home page (login
+// redirect, error page, etc.) so callers can fall back to a real nav.
+function applyHomeHtml(htmlText, opts) {
+  opts = opts || {};
+  let doc;
+  try { doc = new DOMParser().parseFromString(htmlText, "text/html"); }
+  catch (e) { return false; }
+  if (!doc.getElementById("list-body")) return false;
+  const swapInner = (id) => {
+    const fresh = doc.getElementById(id);
+    const cur = document.getElementById(id);
+    if (fresh && cur) cur.innerHTML = fresh.innerHTML;
+  };
+  swapInner("list-body");
+  swapInner("quick-add-region");
+  swapInner("on-list-region");
+  if (opts.flashes) {
+    const fresh = doc.getElementById("flashes");
+    const cur = document.getElementById("flashes");
+    if (fresh && cur) { cur.innerHTML = fresh.innerHTML; scheduleFlashFade(); }
+  }
+  updateListCounters();
+  return true;
+}
+
+let _homeRefreshInFlight = false;
+async function refreshHomeFromServer() {
+  if (_homeRefreshInFlight || !isHomePath()) return;
+  _homeRefreshInFlight = true;
+  try {
+    const r = await fetch("/", { headers: { "X-Requested-With": "fetch" } });
+    if (r.ok) applyHomeHtml(await r.text(), { flashes: false });
+  } catch (e) { /* offline / transient — retry on the next event */ }
+  finally { _homeRefreshInFlight = false; }
+}
+
+// .js-list-mutate forms: POST in the background, then patch the home
+// regions from the redirected "/" response.
+async function submitListForm(form) {
+  const btns = form.querySelectorAll("button[type=submit], button:not([type])");
+  btns.forEach((b) => { b.disabled = true; });
+  try {
+    const resp = await fetch(form.action, {
+      method: (form.method || "POST").toUpperCase(),
+      body: new FormData(form),
+      headers: { "X-Requested-With": "fetch", "X-Client-Id": KASA_CLIENT_ID },
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    if (!applyHomeHtml(await resp.text(), { flashes: true })) {
+      window.location.href = resp.url || "/";
+      return;
+    }
+    if (form.classList.contains("js-reset-on-submit")) {
+      form.reset();
+      const nameInput = form.querySelector('input[name="name"]');
+      if (nameInput) nameInput.focus();
+    }
+  } catch (err) {
+    form.submit();  // degrade to a normal navigation
+  } finally {
+    btns.forEach((b) => { b.disabled = false; });
+  }
+}
+
+document.addEventListener("submit", (e) => {
+  const form = e.target;
+  if (!form.matches || !form.matches(".js-list-mutate")) return;
+  if (e.defaultPrevented) return;   // an inline onsubmit confirm() said no
+  e.preventDefault();
+  submitListForm(form);
+});
+
 (function setupListSync() {
-  if (!("EventSource" in window)) return;
-  // Only useful on the shopping list page.
-  if (location.pathname !== "/" && location.pathname !== "/index") return;
-
-  let reloadTimer = null;
-  let lastReload = Date.now();
-  const MIN_RELOAD_INTERVAL = 1500;
-
+  if (!("EventSource" in window) || !isHomePath()) return;
+  let refreshTimer = null;
   const sse = new EventSource("/events");
-  sse.addEventListener("list_changed", () => {
-    if (reloadTimer) clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => {
-      const focused = document.activeElement;
-      const typing = focused && focused.matches("input, textarea, select");
-      if (typing) return;            // don't clobber a form-in-progress
-      if (document.hidden) return;   // tab hidden; rely on next event
-      if (Date.now() - lastReload < MIN_RELOAD_INTERVAL) return;
-      lastReload = Date.now();
-      location.reload();
-    }, 600);  // brief debounce so a flurry of edits collapses to one reload
+  sse.addEventListener("list_changed", (e) => {
+    if (e.data && e.data === KASA_CLIENT_ID) return;   // our own echo
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      if (document.hidden) return;   // catch up via visibilitychange instead
+      refreshHomeFromServer();
+    }, 500);  // brief debounce so a flurry of edits collapses to one refresh
   });
   sse.onerror = () => {
-    // Browser auto-reconnects EventSource; nothing to do beyond logging.
-    // (Failure here just means real-time off; user can pull-to-refresh.)
+    // Browser auto-reconnects EventSource; real-time just pauses.
   };
 })();
+
+// Catch up when the tab regains focus (events that arrived while it was
+// hidden were skipped above).
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && isHomePath()) refreshHomeFromServer();
+});
 
 // When the recipe edit page loads with #image_file in the URL (because the
 // user tapped the "Add a photo" stock thumbnail), open the file picker.
@@ -171,38 +269,214 @@ window.addEventListener("DOMContentLoaded", () => {
 
 // Toggle checkbox state via fetch so the page doesn't reload while shopping.
 function updateListCounters() {
-  const checkedEl = document.getElementById("list-checked");
-  if (!checkedEl) return;
+  const total = document.querySelectorAll(".item").length;
   const checked = document.querySelectorAll(".item.checked").length;
-  checkedEl.textContent = String(checked);
-  // The total can drift when ad-hoc items are removed; recompute too.
+  const checkedEl = document.getElementById("list-checked");
+  if (checkedEl) checkedEl.textContent = String(checked);
   const totalEl = document.getElementById("list-total");
-  if (totalEl) {
-    totalEl.textContent = String(document.querySelectorAll(".item").length);
-  }
+  if (totalEl) totalEl.textContent = String(total);
+  const prog = document.getElementById("list-progress");
+  if (prog) { prog.max = Math.max(1, total); prog.value = checked; }
 }
 
 document.addEventListener("change", async (e) => {
   const cb = e.target;
   if (!cb.matches(".item .toggle")) return;
   const li = cb.closest(".item");
-  const key = li?.dataset.key;
+  const key = li && li.dataset.key;
   if (!key) return;
-  li.classList.toggle("checked", cb.checked);
+  const checked = cb.checked;
+  li.classList.toggle("checked", checked);
   updateListCounters();
   try {
-    await fetch("/list/toggle", {
+    const r = await fetch("/list/toggle", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key, checked: cb.checked }),
+      headers: { "Content-Type": "application/json", "X-Client-Id": KASA_CLIENT_ID },
+      body: JSON.stringify({ key, checked }),
     });
+    if (!r.ok) {
+      // Server reachable but unhappy — revert the optimistic state.
+      cb.checked = !checked;
+      li.classList.toggle("checked", cb.checked);
+      updateListCounters();
+    }
   } catch (err) {
-    console.error("toggle failed", err);
-    // Revert UI if request failed.
-    cb.checked = !cb.checked;
-    li.classList.toggle("checked", cb.checked);
-    updateListCounters();
+    // Couldn't reach the server (a dead zone in the store, etc.) — keep
+    // the optimistic state and queue the change to replay when we're
+    // back online, rather than silently dropping it.
+    enqueueToggle(key, checked);
   }
+});
+
+// ---------------------------------------------------------------------
+// Offline-resilient check-offs. When /list/toggle can't reach the server
+// we keep the optimistic state and stash the change here, then replay it
+// on the next `online` event or page load. (The Background Sync API
+// isn't available on iOS Safari, so this is the manual version.)
+// ---------------------------------------------------------------------
+const TOGGLE_QUEUE_KEY = "shoppinglist:pendingToggles";
+function loadToggleQueue() {
+  try { return JSON.parse(localStorage.getItem(TOGGLE_QUEUE_KEY)) || []; }
+  catch (e) { return []; }
+}
+function saveToggleQueue(q) {
+  try { localStorage.setItem(TOGGLE_QUEUE_KEY, JSON.stringify(q)); } catch (e) {}
+}
+function enqueueToggle(key, checked) {
+  const q = loadToggleQueue().filter((t) => t.key !== key);  // collapse to latest
+  q.push({ key, checked, ts: Date.now() });
+  saveToggleQueue(q);
+}
+let _flushingToggles = false;
+async function flushToggleQueue() {
+  if (_flushingToggles) return;
+  const snapshot = loadToggleQueue();
+  if (!snapshot.length) return;
+  _flushingToggles = true;
+  let synced = false;
+  try {
+    for (const t of snapshot) {
+      try {
+        const r = await fetch("/list/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Client-Id": KASA_CLIENT_ID },
+          body: JSON.stringify({ key: t.key, checked: t.checked }),
+        });
+        if (!r.ok) break;  // server's there but unhappy — stop, retry later
+        // Drop just this exact entry; a fresh re-toggle would have a
+        // different ts and must survive.
+        saveToggleQueue(
+          loadToggleQueue().filter((x) => !(x.key === t.key && x.ts === t.ts))
+        );
+        synced = true;
+      } catch (e) {
+        break;  // still offline
+      }
+    }
+  } finally { _flushingToggles = false; }
+  if (synced && isHomePath()) refreshHomeFromServer();
+}
+window.addEventListener("online", flushToggleQueue);
+document.addEventListener("DOMContentLoaded", flushToggleQueue);
+
+// ---------------------------------------------------------------------
+// "Hide checked" toggle — collapses checked-off items so the list shrinks
+// to what's left as you shop. Preference persists in localStorage.
+// ---------------------------------------------------------------------
+(function setupHideChecked() {
+  const KEY = "shoppinglist:hideChecked";
+  const list = document.getElementById("list");
+  const btn = document.getElementById("hide-checked-toggle");
+  if (!list || !btn) return;
+  function apply(on) {
+    list.classList.toggle("hide-checked", on);
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+  let on = false;
+  try { on = localStorage.getItem(KEY) === "1"; } catch (e) {}
+  apply(on);
+  btn.addEventListener("click", () => {
+    on = !list.classList.contains("hide-checked");
+    apply(on);
+    try { localStorage.setItem(KEY, on ? "1" : "0"); } catch (e) {}
+  });
+})();
+
+// ---------------------------------------------------------------------
+// Flash messages auto-fade after a few seconds (errors linger longer).
+// ---------------------------------------------------------------------
+function scheduleFlashFade() {
+  document.querySelectorAll(".flashes .flash").forEach((el) => {
+    if (el.dataset.fadeScheduled) return;
+    el.dataset.fadeScheduled = "1";
+    const delay = el.classList.contains("flash-error") ? 9000 : 4500;
+    setTimeout(() => el.classList.add("fade"), delay);
+    setTimeout(() => el.remove(), delay + 600);
+  });
+}
+document.addEventListener("DOMContentLoaded", scheduleFlashFade);
+
+// ---------------------------------------------------------------------
+// Recipe view: client-side ingredient scaling.
+// ---------------------------------------------------------------------
+function kasaFormatQty(qty) {
+  // Mirrors ingredient.format_quantity(): friendly fraction-aware text.
+  if (!isFinite(qty) || qty <= 0) return "";
+  const whole = Math.trunc(qty);
+  const frac = qty - whole;
+  if (Math.abs(frac) < 0.01) return String(whole);
+  for (const denom of [2, 3, 4, 6, 8]) {
+    const num = Math.round(frac * denom);
+    if (num >= 1 && num < denom && Math.abs(frac - num / denom) < 0.02) {
+      let n = num, d = denom;
+      const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+      const g = gcd(n, d);
+      n /= g; d /= g;
+      return whole ? `${whole} ${n}/${d}` : `${n}/${d}`;
+    }
+  }
+  return qty.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+(function setupRecipeScale() {
+  const controls = document.querySelector(".scale-controls");
+  if (!controls) return;
+  const qtyNums = Array.from(document.querySelectorAll(".cook-ings .qty-num[data-base]"));
+  const servesNum = document.querySelector(".serves-num[data-base]");
+  const servesScaled = document.querySelector(".serves-scaled");
+  const custom = controls.querySelector(".scale-custom");
+
+  function applyFactor(factor) {
+    factor = (isFinite(factor) && factor > 0) ? factor : 1;
+    qtyNums.forEach((el) => {
+      const base = parseFloat(el.dataset.base);
+      if (!isFinite(base)) return;
+      el.textContent = kasaFormatQty(base * factor);
+      const li = el.closest("li");
+      if (li) li.classList.toggle("scaled", factor !== 1);
+    });
+    if (servesNum) {
+      const baseS = parseFloat(servesNum.dataset.base);
+      if (factor === 1 || !isFinite(baseS) || baseS <= 0) {
+        servesNum.textContent = servesNum.dataset.base;
+        if (servesScaled) servesScaled.hidden = true;
+      } else {
+        const scaled = baseS * factor;
+        const shown = Number.isInteger(scaled) ? String(scaled) : scaled.toFixed(1);
+        if (servesScaled) { servesScaled.textContent = " → " + shown; servesScaled.hidden = false; }
+      }
+    }
+    let matchedBtn = false;
+    controls.querySelectorAll(".scale-btn").forEach((b) => {
+      const on = parseFloat(b.dataset.factor) === factor;
+      b.classList.toggle("active", on);
+      if (on) matchedBtn = true;
+    });
+    if (custom && matchedBtn && document.activeElement !== custom) custom.value = "";
+  }
+
+  controls.querySelectorAll(".scale-btn").forEach((b) => {
+    b.addEventListener("click", () => applyFactor(parseFloat(b.dataset.factor)));
+  });
+  if (custom) {
+    custom.addEventListener("input", () => {
+      const v = parseFloat(custom.value);
+      applyFactor(isFinite(v) && v > 0 ? v : 1);
+    });
+  }
+})();
+
+// Recipe form: pressing Enter in an ingredient name field adds a new row
+// rather than submitting the whole form (a common data-entry hiccup).
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || !e.target.matches || !e.target.matches('input[name="ing_name[]"]')) return;
+  e.preventDefault();
+  const tpl = document.getElementById("ing-template");
+  const tbody = document.getElementById("ing-rows");
+  if (!tpl || !tbody) return;
+  tbody.appendChild(tpl.content.cloneNode(true));
+  const rows = tbody.querySelectorAll('input[name="ing_name[]"]');
+  if (rows.length) rows[rows.length - 1].focus();
 });
 
 // Auto-timers: scan instruction steps for time mentions ("bake 25 min",
@@ -273,7 +547,13 @@ document.addEventListener("change", async (e) => {
   }
   function initStepTimers() {
     document.querySelectorAll(".cook-step-list .cook-check span").forEach(annotate);
+    // Cook mode shows one step at a time in #cook-step-text — annotate
+    // that too (subsequent steps are annotated by cook mode's render()).
+    const cookStep = document.getElementById("cook-step-text");
+    if (cookStep) annotate(cookStep);
   }
+  // Exposed so cook mode's render() can re-annotate each step it shows.
+  window.__kasaAnnotateTimers = annotate;
 
   // -- Panel + rendering --------------------------------------------------
 
@@ -515,13 +795,13 @@ document.addEventListener("change", async (e) => {
   // -- Click handler ------------------------------------------------------
 
   function getRecipeName() {
-    const h = document.querySelector(".recipe-view h1");
-    return h ? h.textContent.trim() : (document.title || "").replace(/ · .*/, "").trim();
+    const h = document.querySelector(".recipe-view h1, .cook-title");
+    return h ? h.textContent.trim() : (document.title || "").replace(/ [·—].*/, "").trim();
   }
   function getStepText(btn) {
-    const li = btn.closest("li");
-    if (!li) return "";
-    return li.textContent.replace(/\s+/g, " ").trim().slice(0, 90);
+    const ctx = btn.closest("li, .cook-step");
+    if (!ctx) return "";
+    return ctx.textContent.replace(/\s+/g, " ").trim().slice(0, 90);
   }
 
   document.addEventListener("click", (e) => {
@@ -617,7 +897,7 @@ document.addEventListener("submit", async (e) => {
     const r = await fetch(form.action, {
       method: "POST",
       body: data,
-      headers: { "X-Requested-With": "fetch" },
+      headers: { "X-Requested-With": "fetch", "X-Client-Id": KASA_CLIENT_ID },
     });
     if (!r.ok) throw new Error("network");
     btn.textContent = "✓ Added";

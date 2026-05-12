@@ -8,6 +8,7 @@ import secrets
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -110,6 +111,23 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
         "ORDER BY r.name"
     ).fetchall()
 
+    # Fetch every recipe's ingredients in ONE query rather than firing
+    # one per list_recipe row (N+1) — mirrors the batching the /recipes
+    # page already does. ORDER BY recipe_id, id keeps each recipe's rows
+    # in insertion order, matching the old per-recipe query's behavior.
+    ings_by_recipe: dict[int, list] = defaultdict(list)
+    recipe_ids = [lr["recipe_id"] for lr in list_rows]
+    if recipe_ids:
+        unique_ids = list(dict.fromkeys(recipe_ids))  # dedupe, preserve order
+        placeholders = ",".join("?" * len(unique_ids))
+        for ing in db.execute(
+            "SELECT recipe_id, name, quantity, unit, category, note "
+            f"FROM ingredient WHERE recipe_id IN ({placeholders}) "
+            "ORDER BY recipe_id, id",
+            unique_ids,
+        ).fetchall():
+            ings_by_recipe[ing["recipe_id"]].append(ing)
+
     # key -> AggregatedItem
     bucket: dict[str, AggregatedItem] = {}
     # For dim-keyed buckets, track the running sum in canonical base
@@ -118,12 +136,7 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
     canonical_sums: dict[str, list] = {}  # key -> [dimension, base_total]
 
     for lr in list_rows:
-        ings = db.execute(
-            "SELECT name, quantity, unit, category, note "
-            "FROM ingredient WHERE recipe_id = ?",
-            (lr["recipe_id"],),
-        ).fetchall()
-        for ing in ings:
+        for ing in ings_by_recipe.get(lr["recipe_id"], []):
             n_name = normalize_name(ing["name"])
             n_unit = normalize_unit(ing["unit"])
             qty = float(ing["quantity"]) * float(lr["multiplier"])
@@ -437,6 +450,21 @@ def _broadcast(event_type: str, data: str = "1") -> None:
             pass
 
 
+def _client_id() -> str:
+    """The originating browser tab's id, sent on list-mutation requests
+    via the X-Client-Id header. We echo it back on the SSE stream so that
+    tab can ignore its own event (it already updated the DOM optimistically)
+    instead of doing a redundant refresh. Empty for non-JS clients —
+    those events just look 'foreign' to every tab, which is harmless."""
+    return (request.headers.get("X-Client-Id") or "")[:64]
+
+
+def _list_changed() -> None:
+    """Fan out a 'list_changed' SSE event tagged with the requesting
+    tab's client id (see _client_id)."""
+    _broadcast("list_changed", _client_id())
+
+
 def _top_predicted_items(db, limit: int = 8) -> list[dict]:
     """Return up to `limit` items the user is likely to want to add next.
 
@@ -583,6 +611,100 @@ def _top_predicted_items(db, limit: int = 8) -> list[dict]:
         }))
     scored.sort(key=lambda x: -x[0])
     return [item for _, item in scored[:limit]]
+
+
+# Process-level cache for the Quick Add predictor. `_top_predicted_items`
+# fires ~4 non-trivial queries (including a co-occurrence self-join) and
+# `index()` runs on every home-page load — including the SSE-triggered
+# reload every connected device does whenever anyone checks an item off.
+# The result only changes when the active list or the purchase history
+# changes, so we cache it keyed on a cheap DB signature (plus a 1-hour
+# backstop so the time-relative recency/replenishment scores can't drift
+# stale forever). Editing a recipe that's *already on the list* won't
+# bump the signature — that's a tolerated, short-lived staleness.
+_predict_cache: dict = {"sig": None, "ts": 0.0, "result": []}
+_predict_cache_lock = threading.Lock()
+_PREDICT_CACHE_TTL = 3600.0  # seconds
+
+
+def _predict_signature(db) -> str:
+    """Cheap fingerprint of everything `_top_predicted_items` depends on:
+    which recipes/ad-hoc items are on the list, and how many purchase
+    events exist. COUNT + SUM(id) catches add/remove/swap; MAX(id) on
+    purchase_history catches a new check-off."""
+    r = db.execute(
+        "SELECT "
+        " (SELECT COUNT(*) FROM list_recipe) c1, "
+        " (SELECT IFNULL(SUM(recipe_id), 0) FROM list_recipe) s1, "
+        " (SELECT COUNT(*) FROM adhoc_item) c2, "
+        " (SELECT IFNULL(SUM(id), 0) FROM adhoc_item) s2, "
+        " (SELECT IFNULL(MAX(id), 0) FROM purchase_history) m3"
+    ).fetchone()
+    return f"{r['c1']}:{r['s1']}:{r['c2']}:{r['s2']}:{r['m3']}"
+
+
+def _top_predicted_items_cached(db, limit: int = 8) -> list[dict]:
+    """Cached wrapper around `_top_predicted_items` — see the cache note
+    above. Falls through to a fresh compute on signature change or TTL
+    expiry."""
+    sig = _predict_signature(db)
+    now = time.monotonic()
+    with _predict_cache_lock:
+        if (
+            _predict_cache["sig"] == sig
+            and now - _predict_cache["ts"] < _PREDICT_CACHE_TTL
+        ):
+            return _predict_cache["result"][:limit]
+    result = _top_predicted_items(db, limit=max(limit, 8))
+    with _predict_cache_lock:
+        _predict_cache["sig"] = sig
+        _predict_cache["ts"] = now
+        _predict_cache["result"] = result
+    return result[:limit]
+
+
+def _log_purchase_for_key(db, key: str) -> None:
+    """Record a checked-off shopping-list item as a purchase event for
+    the Quick Add predictor.
+
+    The aggregated keys built by `build_shopping_list` come in two
+    shapes:
+      * "adhoc::<id>"               — look the name/unit up in adhoc_item
+      * "recipe::<name>::<unit>"    — name/unit are right in the key
+      * "recipe::<name>::dim:<dim>" — quantity-merged; unit is unknowable
+                                      from the key, so store it blank
+    `<name>` here is the *normalized* name; title-case it for storage so
+    the predictor chip reads "Flour" not "flour", matching how recipe-
+    derived and ad-hoc names are displayed elsewhere."""
+    name = ""
+    unit = ""
+    if key.startswith("adhoc::"):
+        try:
+            adhoc_id = int(key[len("adhoc::"):])
+        except ValueError:
+            return
+        row = db.execute(
+            "SELECT name, unit FROM adhoc_item WHERE id = ?", (adhoc_id,)
+        ).fetchone()
+        if row is None:
+            return
+        name = (row["name"] or "").strip()
+        unit = (row["unit"] or "").strip()
+    elif key.startswith("recipe::"):
+        parts = key.split("::")
+        if len(parts) < 3:
+            return
+        name = parts[1].strip().title()
+        third = parts[2]
+        unit = "" if third.startswith("dim:") else third.strip()
+    else:
+        return
+    if not name:
+        return
+    db.execute(
+        "INSERT INTO purchase_history (name, unit) VALUES (?, ?)",
+        (name, unit),
+    )
 
 
 def _refresh_recipe_embedding(db, recipe_id: int) -> None:
@@ -1213,7 +1335,7 @@ def create_app() -> Flask:
         grouped = build_shopping_list(db)
         total_items = sum(len(v) for v in grouped.values())
         checked_count = sum(1 for items in grouped.values() for i in items if i.checked)
-        quick_add = _top_predicted_items(db, limit=8)
+        quick_add = _top_predicted_items_cached(db, limit=8)
         return render_template(
             "index.html",
             recipes=recipes,
@@ -1852,6 +1974,9 @@ def create_app() -> Flask:
         db.commit()
         if image_url:
             _delete_uploaded_image_file(image_url, except_recipe_id=recipe_id)
+        # Deleting a recipe cascades to list_recipe — tell open shopping
+        # list views to refresh.
+        _list_changed()
         flash("Recipe deleted.", "success")
         return redirect(url_for("recipes_page"))
 
@@ -1979,6 +2104,7 @@ def create_app() -> Flask:
                 (r["recipe_id"], r["multiplier"], "Plan"),
             )
         db.commit()
+        _list_changed()
         flash(
             f"Added {len(rows)} planned recipe(s) to the shopping list.",
             "success",
@@ -2365,7 +2491,7 @@ def create_app() -> Flask:
             (recipe_id, multiplier, added_by),
         )
         db.commit()
-        _broadcast("list_changed")
+        _list_changed()
         flash(f"Added {recipe['name']} to the shopping list.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -2374,7 +2500,7 @@ def create_app() -> Flask:
         db = get_db()
         db.execute("DELETE FROM list_recipe WHERE id = ?", (list_recipe_id,))
         db.commit()
-        _broadcast("list_changed")
+        _list_changed()
         flash("Recipe removed from list.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -2408,14 +2534,12 @@ def create_app() -> Flask:
             "VALUES (?, ?, ?, ?, ?, ?)",
             (name, qty, unit, category, note, added_by),
         )
-        # Record the add as a "purchase event" — drives the Quick Add
-        # predictor on the home page (recency + frequency scoring).
-        db.execute(
-            "INSERT INTO purchase_history (name, unit) VALUES (?, ?)",
-            (name, unit),
-        )
+        # NB: the "purchase event" that feeds the Quick Add predictor is
+        # recorded when an item is *checked off* (see list_toggle), not
+        # when it's added — so recipe-derived staples count too, not just
+        # one-off ad-hoc adds.
         db.commit()
-        _broadcast("list_changed")
+        _list_changed()
         flash(f"Added {name} to the shopping list.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -2425,7 +2549,7 @@ def create_app() -> Flask:
         db.execute("DELETE FROM adhoc_item WHERE id = ?", (adhoc_id,))
         db.execute("DELETE FROM checked_item WHERE key = ?", (f"adhoc::{adhoc_id}",))
         db.commit()
-        _broadcast("list_changed")
+        _list_changed()
         flash("Item removed.", "success")
         return redirect(url_for("index", _anchor="list"))
 
@@ -2439,29 +2563,38 @@ def create_app() -> Flask:
             return jsonify({"ok": False, "error": "missing key"}), 400
         db = get_db()
         if checked in (True, "true", "1", "on"):
-            db.execute(
+            cur = db.execute(
                 "INSERT OR IGNORE INTO checked_item (key) VALUES (?)", (key,)
             )
+            # rowcount == 0 means it was already checked (a re-toggle, or
+            # a duplicate request) — only log a purchase event on a fresh
+            # check so frequency scoring isn't inflated by churn.
+            if cur.rowcount:
+                _log_purchase_for_key(db, key)
         else:
             db.execute("DELETE FROM checked_item WHERE key = ?", (key,))
         db.commit()
-        _broadcast("list_changed")
+        _list_changed()
         return jsonify({"ok": True})
 
     @app.route("/list/clear", methods=["POST"])
     def list_clear():
         scope = request.form.get("scope", "all")
         db = get_db()
+        # Only drop the checked_item rows that belong to whatever we're
+        # clearing — so "clear recipes" doesn't also forget which ad-hoc
+        # items were already checked off, and vice versa. ("all" clears
+        # both prefixes = everything; "checks" wipes checked_item alone.)
         if scope in ("all", "recipes"):
             db.execute("DELETE FROM list_recipe")
+            db.execute("DELETE FROM checked_item WHERE key LIKE 'recipe::%'")
         if scope in ("all", "adhoc"):
             db.execute("DELETE FROM adhoc_item")
+            db.execute("DELETE FROM checked_item WHERE key LIKE 'adhoc::%'")
         if scope == "checks":
             db.execute("DELETE FROM checked_item")
-        else:
-            db.execute("DELETE FROM checked_item")
         db.commit()
-        _broadcast("list_changed")
+        _list_changed()
         flash("Shopping list cleared.", "success")
         return redirect(url_for("index"))
 
@@ -2585,6 +2718,9 @@ def create_app() -> Flask:
             _delete_uploaded_image_file(
                 old_image_url, except_recipe_id=recipe_id
             )
+        # If this recipe is on the active shopping list, its ingredients
+        # may have changed — tell open list views to refresh.
+        _list_changed()
         flash(f"Saved recipe: {name}.", "success")
         return redirect(url_for("recipes_page"))
 

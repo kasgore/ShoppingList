@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from contextlib import closing
 
 from flask import g
@@ -96,8 +97,11 @@ CREATE INDEX IF NOT EXISTS idx_meal_plan_date ON meal_plan(plan_date);
 CREATE INDEX IF NOT EXISTS idx_meal_plan_recipe_id ON meal_plan(recipe_id);
 
 CREATE TABLE IF NOT EXISTS purchase_history (
-    -- One row per ad-hoc add. Drives the "Quick Add" predictor on the
-    -- shopping list home page (recency + frequency scoring).
+    -- One row per item checked off the shopping list — the "I bought
+    -- it" signal, recipe-derived staples included, not just one-off
+    -- ad-hoc adds. Drives the "Quick Add" predictor on the home page
+    -- (recency + frequency + co-occurrence + replenishment-cycle
+    -- scoring). Written from app.list_toggle on a fresh check-off.
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT    NOT NULL,
     unit       TEXT    NOT NULL DEFAULT '',
@@ -242,28 +246,58 @@ def init_db() -> None:
             )
             conn.commit()
 
-        # Best-effort: create the vec0 virtual table for semantic search
-        # and backfill embeddings for any recipes that don't have one.
-        # Skipped silently if fastembed/sqlite-vec aren't installed —
-        # keyword search continues working in that case.
+        # Best-effort: create the vec0 virtual table for semantic search.
+        # The table itself must exist before any /recipes search runs, so
+        # do that synchronously here — but the actual embedding backfill
+        # (which has to load the ~22 MB MiniLM model and encode every
+        # recipe — several seconds on a Pi) is handed off to a daemon
+        # thread so it never blocks app startup. Skipped silently if
+        # fastembed/sqlite-vec aren't installed — keyword search keeps
+        # working in that case.
         try:
             import embedding as _embedding
         except ImportError:
             return
         if not _embedding.init_schema(conn):
             return
-        if not _embedding.is_available():
+    threading.Thread(
+        target=_backfill_embeddings, name="embedding-backfill", daemon=True
+    ).start()
+
+
+def _backfill_embeddings() -> None:
+    """Encode any recipes that don't yet have a semantic embedding.
+
+    Runs off the app-startup path in a daemon thread — the MiniLM model
+    load alone is several seconds on a Pi 4. Best-effort: if
+    fastembed/sqlite-vec aren't usable, search just stays keyword-only.
+    Uses its own short-lived connection (WAL mode, set in init_db, lets
+    this coexist with request traffic; busy_timeout covers write
+    contention with a concurrent recipe save).
+    """
+    try:
+        import embedding as _embedding
+    except ImportError:
+        return
+    if not _embedding.is_available():
+        return
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        _apply_connection_pragmas(conn)
+        if not _embedding.setup_extension(conn):
             return
-        # Use a row factory so build_recipe_text can do row["col"] lookup.
         conn.row_factory = sqlite3.Row
-        existing_ids = {
-            r[0] for r in conn.execute(
-                "SELECT recipe_id FROM recipe_embedding"
-            ).fetchall()
-        }
-        all_ids = {
-            r[0] for r in conn.execute("SELECT id FROM recipe").fetchall()
-        }
+        try:
+            existing_ids = {
+                r[0] for r in conn.execute(
+                    "SELECT recipe_id FROM recipe_embedding"
+                ).fetchall()
+            }
+            all_ids = {
+                r[0] for r in conn.execute("SELECT id FROM recipe").fetchall()
+            }
+        except sqlite3.OperationalError:
+            # vec0 table not present on this build — nothing to backfill.
+            return
         missing = sorted(all_ids - existing_ids)
         for rid in missing:
             row = conn.execute(
@@ -271,6 +305,8 @@ def init_db() -> None:
                 "FROM recipe WHERE id = ?",
                 (rid,),
             ).fetchone()
+            if row is None:
+                continue
             ings = conn.execute(
                 "SELECT name FROM ingredient WHERE recipe_id = ?", (rid,)
             ).fetchall()

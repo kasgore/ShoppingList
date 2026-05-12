@@ -7,7 +7,7 @@
     <div class="rv-title">
       <h1>{{ recipe.name }}</h1>
       <p class="muted">
-        Serves {{ recipe.servings }}
+        Serves <span class="serves-num" data-base="{{ recipe.servings }}">{{ recipe.servings }}</span><span class="serves-scaled" hidden></span>
         {% if recipe.yields_text and recipe.yields_text|lower not in (recipe.servings|string + ' servings') %}
           ({{ recipe.yields_text }})
         {% endif %}
@@ -22,6 +22,19 @@
           · source rating {{ '%.1f' % recipe.source_rating }}/5
         {% endif %}
       </p>
+
+      {# Client-side ingredient scaling — see setupRecipeScale() in app.js. #}
+      <div class="scale-controls" data-base-servings="{{ recipe.servings }}">
+        <span class="scale-label">Scale</span>
+        <button type="button" class="scale-btn" data-factor="0.5">½×</button>
+        <button type="button" class="scale-btn active" data-factor="1">1×</button>
+        <button type="button" class="scale-btn" data-factor="2">2×</button>
+        <button type="button" class="scale-btn" data-factor="3">3×</button>
+        <label class="scale-custom-wrap">×
+          <input type="number" class="scale-custom" min="0.1" step="0.1"
+                 inputmode="decimal" placeholder="N" aria-label="Custom scale">
+        </label>
+      </div>
       {% if recipe.keywords %}
         <p class="keywords">
           {% for k in recipe.keywords.split(',') %}
@@ -87,7 +100,7 @@
           <li>
             <label class="cook-check">
               <input type="checkbox">
-              <span class="qty">{{ ing.quantity|fmtqty }} {{ ing.unit }}</span>
+              <span class="qty"><span class="qty-num" data-base="{{ ing.quantity }}">{{ ing.quantity|fmtqty }}</span>{% if ing.unit %} {{ ing.unit }}{% endif %}</span>
               <span class="name">{{ ing.name }}</span>
               {% if ing.note %}<span class="note">— {{ ing.note }}</span>{% endif %}
             </label>
