@@ -1,17 +1,81 @@
+# --- Python bytecode / build artifacts ---
 __pycache__/
-*.pyc
-*.pyo
-.venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
 venv/
+.venv/
+env/
+ENV/
+.python-version
+
+# --- Production data (NEVER commit; lives on the server) ---
+# The SQLite DB holds every recipe, list, meal plan, pantry item.
 shoppinglist.db
+shoppinglist.db-journal
+shoppinglist.db-wal
+shoppinglist.db-shm
+*.sqlite
+*.sqlite3
+
+# Uploaded recipe photos.
 static/uploads/
-.secret_key
+
+# Auto-backups and pre-restore snapshots written at runtime.
+backups/
+snapshots/
+auto_backups/
+*.backup.zip
+*.snapshot.zip
 pre-restore-*.db
 pre-restore-*.zip
 
-# But DO commit anything explicitly placed under seed_data/ — it's
-# the deploy-time snapshot that gets baked into the Docker image.
+# Flask sessions stored on disk.
+.flask_session/
+
+# BUT do commit anything explicitly placed under seed_data/ — it's
+# the deploy-time snapshot baked into the Docker image, so the seed
+# DB and its photos must be tracked even though the root-level
+# shoppinglist.db and static/uploads/ are not.
 !seed_data/
 !seed_data/**
-.flask_session/
+
+# --- Environment / secrets ---
+.env
+.env.local
+.env.*.local
+.secret_key
+*.pem
+*.key
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Test/coverage artifacts ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# --- One-off scratch / preview files (not part of the app) ---
+style-previews.html
+brand-icon-previews.html
+
+# --- Docker volumes mounted at dev time ---
+*.local.yml

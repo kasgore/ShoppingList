@@ -1,12 +1,12 @@
 {% extends "base.html" %}
-{% block title %}Backup · Kasa{% endblock %}
+{% block title %}Backup · Sookie{% endblock %}
 
 {% block content %}
 <section class="card">
   <h2>Backup</h2>
   <p class="muted">
     Downloads a single ZIP containing every recipe, ingredient, shopping list
-    state, meal plan, and uploaded photo. Restoring this file on any Kasa
+    state, meal plan, and uploaded photo. Restoring this file on any Sookie
     instance reproduces the family's full state.
   </p>
   <ul class="muted small-note">
@@ -55,7 +55,7 @@
   </p>
   <form action="{{ url_for('backup_restore') }}" method="post"
         enctype="multipart/form-data" class="stack"
-        onsubmit="return confirm('Replace everything in this Kasa with the uploaded backup?');">
+        onsubmit="return confirm('Replace everything in this Sookie with the uploaded backup?');">
     <label>
       <span>Backup file (.zip preferred, .db accepted for legacy)</span>
       <input type="file" name="backup" accept=".zip,.db" required>

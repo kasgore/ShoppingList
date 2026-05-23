@@ -2535,7 +2535,7 @@ def create_app() -> Flask:
 
     def _restore_from_db_only(db_path: str) -> tuple[bool, str]:
         if not _is_valid_kasa_db(db_path):
-            return False, "That .db file is not a Kasa backup."
+            return False, "That .db file is not a Sookie backup."
         try:
             src = sqlite3.connect(db_path)
             dst = sqlite3.connect(DB_PATH)

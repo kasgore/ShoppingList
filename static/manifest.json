@@ -1,13 +1,13 @@
 {
-  "name": "Kasa",
-  "short_name": "Kasa",
+  "name": "Sookie",
+  "short_name": "Sookie",
   "description": "Pick recipes, build a shared shopping list, and cook from your phone.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "theme_color": "#2f7d32",
-  "background_color": "#f7f7f5",
+  "theme_color": "#6b8c4a",
+  "background_color": "#f4f0e8",
   "icons": [
     {
       "src": "/static/icons/icon-192.png",
