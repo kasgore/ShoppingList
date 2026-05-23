@@ -11,7 +11,7 @@ from contextlib import closing
 
 from flask import g
 
-from ingredient import guess_category
+from ingredient import guess_category, normalize_name
 
 
 DB_PATH = os.environ.get(
@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS app_meta (
 # Bump this whenever the rules in ingredient.guess_category() change.
 # init_db() will re-run the "Other" reclassification on the next start
 # only if the persisted value disagrees with this one.
-CLASSIFIER_VERSION = "1"
+CLASSIFIER_VERSION = "2"
 
 
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
@@ -259,6 +259,19 @@ def init_db() -> None:
                 (CLASSIFIER_VERSION,),
             )
             conn.commit()
+
+        # Re-normalize pantry rows in case normalize_name's rules
+        # changed (e.g. stripping new redundant qualifiers). Cheap — the
+        # pantry table is small and user-managed.
+        for row in conn.execute(
+            "SELECT id, name FROM pantry_item"
+        ).fetchall():
+            fresh = normalize_name(row[1])
+            conn.execute(
+                "UPDATE pantry_item SET normalized = ? WHERE id = ?",
+                (fresh, row[0]),
+            )
+        conn.commit()
 
         # Best-effort: create the vec0 virtual table for semantic search.
         # The table itself must exist before any /recipes search runs, so

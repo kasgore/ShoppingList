@@ -76,6 +76,8 @@ UNIT_ALIASES = {
     "slices": "slice",
     "stick": "stick",
     "sticks": "stick",
+    "piece": "piece",
+    "pieces": "piece",
 }
 
 
@@ -116,19 +118,25 @@ UNIT_DIMENSIONS: dict[str, tuple[str, float]] = {
     "lb":    ("mass",     453.592),
 }
 
-# Display breakpoints: (max_value_in_base_unit, display_unit).
-# When the aggregated total in base units is < max_value, render in
-# display_unit. Last entry uses inf to catch the tail.
-_VOLUME_DISPLAY_BREAKPOINTS: list[tuple[float, str]] = [
-    (15.0, "tsp"),       # under one tablespoon (~3 tsp) → tsp
-    (180.0, "tbsp"),     # under three-quarters of a cup → tbsp
-    (1000.0, "cup"),     # under a liter → cup
-    (float("inf"), "l"), # otherwise liters
+# Per-unit "promote to this unit when" rules: (unit, min_v, require_clean).
+# `min_v` is the smallest v in this unit that justifies promotion from
+# the previous (smaller) one; `require_clean` means the format_quantity()
+# rendering must not fall back to a decimal (so "1/4 cup" beats "0.27 cup").
+# Empirically tuned to cooking conventions:
+#   - tsp→tbsp only at v_tbsp >= 1 (so "2 tsp" stays tsp, not "2/3 tbsp").
+#   - tbsp→cup at v_cup >= 1/4 AND clean (so "1/3 cup" beats "5 1/3 tbsp"
+#     but "3 tbsp" beats "3/16 cup").
+# Liter is left out of volume — US family recipes are cup-centric.
+_VOLUME_PROMOTIONS: list[tuple[str, float, bool]] = [
+    ("tsp",  0.0,  False),
+    ("tbsp", 1.0,  False),
+    ("cup",  0.25, True),
 ]
-_MASS_DISPLAY_BREAKPOINTS: list[tuple[float, str]] = [
-    (28.0, "g"),         # under an ounce → grams
-    (1000.0, "oz"),      # under a kilogram → ounces
-    (float("inf"), "kg"),
+_MASS_PROMOTIONS: list[tuple[str, float, bool]] = [
+    ("g",  0.0,  False),
+    ("oz", 1.0,  True),
+    ("lb", 0.5,  True),   # 1/2 lb shows as lb; 1/4 lb stays as 4 oz
+    ("kg", 1.0,  True),
 ]
 
 
@@ -144,26 +152,62 @@ def to_canonical_qty(qty: float, unit: str) -> tuple[str, float] | None:
     return dimension, qty * factor
 
 
+def _is_clean_display(v: float) -> bool:
+    """True if format_quantity(v) doesn't fall back to a decimal — i.e.
+    it found an integer or a clean fraction form. Used by `from_canonical`
+    to avoid promoting to a unit that would render as "0.27 cup"."""
+    s = format_quantity(v)
+    return bool(s) and "." not in s
+
+
 def from_canonical(qty_in_base: float, dimension: str) -> tuple[float, str]:
     """Pick a sensible display unit + quantity for an aggregated total
-    expressed in canonical base units. Returns (display_qty, display_unit)."""
+    expressed in canonical base units. Returns (display_qty, display_unit).
+
+    Walks unit candidates smallest → largest, promoting whenever the
+    candidate's threshold is met (see _VOLUME_PROMOTIONS / _MASS_PROMOTIONS)."""
     if dimension == "volume":
-        breakpoints = _VOLUME_DISPLAY_BREAKPOINTS
+        promotions = _VOLUME_PROMOTIONS
     elif dimension == "mass":
-        breakpoints = _MASS_DISPLAY_BREAKPOINTS
+        promotions = _MASS_PROMOTIONS
     else:
         return qty_in_base, ""
-    for max_val, display_unit in breakpoints:
-        if qty_in_base < max_val:
-            _, target_factor = UNIT_DIMENSIONS[display_unit]
-            return qty_in_base / target_factor, display_unit
-    # Safety net — shouldn't reach here because the last breakpoint is inf.
-    last_unit = breakpoints[-1][1]
-    return qty_in_base / UNIT_DIMENSIONS[last_unit][1], last_unit
+
+    smallest = promotions[0][0]
+    best: tuple[str, float] = (
+        smallest, qty_in_base / UNIT_DIMENSIONS[smallest][1]
+    )
+    for unit, min_v, require_clean in promotions:
+        v = qty_in_base / UNIT_DIMENSIONS[unit][1]
+        if v < min_v:
+            continue
+        if require_clean and not _is_clean_display(v):
+            continue
+        best = (unit, v)
+    return best[1], best[0]
+
+
+# Common adjectives that don't change the shopping identity of an
+# ingredient — stripped so "Organic Brown Sugar" merges with "Brown
+# Sugar". Curated conservatively: color qualifiers (white/brown sugar)
+# and dietary forms (low-sodium/reduced-fat) stay, because they change
+# what you'd actually buy.
+_NAME_QUALIFIER_STRIP_RE = re.compile(
+    r"\b("
+    r"organic|raw|pure|fresh|"
+    r"extra[- ]virgin|virgin|"
+    r"all[- ]purpose|granulated"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_name(name: str) -> str:
-    return name.strip().lower()
+    """Lowercase and strip a short list of redundant qualifiers so
+    near-duplicates aggregate together on the shopping list."""
+    n = name.strip().lower()
+    n = _NAME_QUALIFIER_STRIP_RE.sub("", n)
+    return re.sub(r"\s+", " ", n).strip()
 
 
 def format_quantity(qty: float) -> str:
@@ -281,6 +325,38 @@ _TRAILING_QUALIFIER_RE = re.compile(
 # size, not the quantity itself. Becomes a note.
 _POST_QTY_PAREN_RE = re.compile(r"^\s*\(([^)]+)\)\s+")
 
+# Leading size descriptor like "3-inch piece fresh ginger" — without this
+# the quantity parser reads "3" as qty and "-Inch Piece Fresh Ginger" as
+# the name. Lifts the whole "N-unit" token into a note, then the parser
+# sees "piece fresh ginger" and aggregates as 1 piece.
+_LEADING_SIZE_RE = re.compile(
+    r"^(\d+(?:\.\d+)?\s*[-–]\s*(?:"
+    r"inch|in|cm|mm|foot|feet|ft|"
+    r"pound|pounds|lb|lbs|"
+    r"oz|ounce|ounces|"
+    r"gram|grams|g|kg|kilo|kilos|"
+    r"liter|liters|l|milliliter|milliliters|ml"
+    r")\b)\s*",
+    re.IGNORECASE,
+)
+
+# Recipe-page footnote pointer that ends up inside a trailing parenthetical
+# — "3 medium overripe bananas (Notes 1 and 2)". Dropped from the note
+# field; the reference is meaningless once you're at the store.
+_FOOTNOTE_NOTE_RE = re.compile(
+    r"^\s*(?:notes?|see|footnotes?|step|steps?)\s*\d+"
+    r"(?:\s*(?:,|and|&)\s*\d+)*\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+# "1 and ½ cups" / "1 and 1/2 cups" — recipe text sometimes spells out
+# the connector between the whole part and the fraction. Collapse to a
+# single space so _parse_quantity_token reads it as a mixed number.
+_AND_FRACTION_RE = re.compile(
+    r"(\d)\s+and\s+([" + "".join(VULGAR_FRACTIONS) + r"]|\d+/\d+)",
+    re.IGNORECASE,
+)
+
 
 def parse_ingredient(line: str) -> dict:
     """Parse a free-form ingredient string like '1 1/2 cups flour, sifted'
@@ -305,6 +381,14 @@ def parse_ingredient(line: str) -> dict:
         leading_modifier = mod_match.group(0).strip().rstrip(",").lower()
         original = original[mod_match.end():]
 
+    # Lift a leading size descriptor ("3-inch piece fresh ginger") into a
+    # note so the quantity parser doesn't read "3" as the count.
+    leading_size = ""
+    size_match = _LEADING_SIZE_RE.match(original)
+    if size_match:
+        leading_size = size_match.group(1).strip()
+        original = original[size_match.end():]
+
     # Capture trailing parenthetical as a note. Done before quantity
     # parsing so "1 small garlic clove (1/2 medium)" doesn't drag the
     # "(1/2 medium)" into the name field.
@@ -313,6 +397,11 @@ def parse_ingredient(line: str) -> dict:
     if trail_match:
         trailing_note = trail_match.group(1).strip()
         original = original[:trail_match.start()].rstrip()
+    # Footnote pointers ("Notes 1 and 2", "See 3") that recipe pages
+    # sometimes leave inside trailing parens carry no useful info once
+    # you're at the store — drop them entirely.
+    if trailing_note and _FOOTNOTE_NOTE_RE.match(trailing_note):
+        trailing_note = ""
 
     # Capture trailing qualifier phrases ("to taste", "for serving",
     # etc.) as a note. Same reason — they aren't part of the ingredient
@@ -322,6 +411,9 @@ def parse_ingredient(line: str) -> dict:
     if qual_match:
         trailing_qualifier = qual_match.group(1).strip().lower()
         original = original[:qual_match.start()].rstrip()
+
+    # "1 and ½ cups" → "1 ½ cups" so the mixed-number parser handles it.
+    original = _AND_FRACTION_RE.sub(r"\1 \2", original)
 
     qty, rest = _parse_quantity_token(original)
     if qty is not None:
@@ -349,11 +441,12 @@ def parse_ingredient(line: str) -> dict:
     if "," in rest:
         head, _, tail = rest.partition(",")
         rest, note = head.strip(), tail.strip()
-    # Merge in every note-piece we lifted off elsewhere. Order:
-    # leading modifier, post-quantity paren, comma-tail, trailing
-    # qualifier, trailing paren.
+    # Merge in every note-piece we lifted off elsewhere. Order: leading
+    # modifier, leading size descriptor, post-quantity paren, comma-tail,
+    # trailing qualifier, trailing paren.
     note_parts = [p for p in (
         leading_modifier,
+        leading_size,
         post_paren_note,
         note,
         trailing_qualifier,
@@ -393,146 +486,165 @@ def parse_ingredient(line: str) -> dict:
     }
 
 
+_CATEGORY_RULES: list[tuple[str, list[str]]] = [
+    ("Produce", [
+        # Greens & lettuces
+        "arugula", "rocket", "lettuce", "romaine", "iceberg", "spinach",
+        "kale", "chard", "collard", "endive", "watercress", "frisee",
+        "radicchio", "mesclun", "microgreen", "sprouts",
+        # Herbs (fresh)
+        "basil", "parsley", "cilantro", "mint", "dill", "thyme",
+        "rosemary", "sage", "oregano", "tarragon", "chive", "scallion",
+        "green onion", "leek", "shallot",
+        # Cruciferous & alliums
+        "broccoli", "cauliflower", "cabbage", "brussels", "bok choy",
+        "onion", "garlic", "fennel",
+        # Roots & tubers
+        "potato", "sweet potato", "yam", "carrot", "beet", "turnip",
+        "parsnip", "radish", "ginger", "turmeric", "rutabaga",
+        "jicama", "kohlrabi",
+        # Squash family
+        "zucchini", "squash", "pumpkin", "cucumber", "eggplant",
+        # Peppers (fresh)
+        "bell pepper", "jalapeno", "jalapeño", "serrano", "habanero",
+        "poblano", "chili pepper", "chile pepper", "anaheim",
+        # Tomatoes (fresh)
+        "tomato", "cherry tomato", "grape tomato",
+        # Other vegetables
+        "celery", "asparagus", "artichoke", "okra", "snap pea",
+        "snow pea", "green bean", "pea pod", "corn on the cob",
+        "mushroom", "shiitake", "portobello", "cremini",
+        # Fruit
+        "apple", "banana", "orange", "lemon", "lime", "grapefruit",
+        "berry", "strawberry", "blueberry", "raspberry", "blackberry",
+        "grape", "melon", "watermelon", "cantaloupe", "honeydew",
+        "peach", "plum", "pear", "pineapple", "mango", "kiwi",
+        "papaya", "avocado", "cherry", "apricot", "fig", "date",
+        "pomegranate", "coconut", "fresh herb",
+    ]),
+    ("Meat & Seafood", [
+        "beef", "steak", "ribeye", "sirloin", "brisket", "filet",
+        "ground beef", "ground turkey", "ground pork", "ground chicken",
+        "chicken", "drumstick", "thigh", "wing", "breast",
+        "pork", "bacon", "ham", "prosciutto", "pancetta", "sausage",
+        "chorizo", "kielbasa", "hot dog", "pepperoni", "salami",
+        "turkey", "lamb", "veal", "duck",
+        "shrimp", "prawn", "fish", "salmon", "tuna", "cod", "tilapia",
+        "trout", "halibut", "scallop", "crab", "lobster", "clam",
+        "mussel", "oyster", "anchovy", "sardine",
+    ]),
+    ("Dairy & Eggs", [
+        "milk", "buttermilk", "half and half", "half-and-half",
+        "cream", "heavy cream", "sour cream", "whipping cream",
+        "butter", "ghee", "margarine",
+        "cheese", "parmesan", "mozzarella", "cheddar", "gouda",
+        "swiss cheese", "feta", "ricotta", "cottage cheese",
+        "cream cheese", "blue cheese", "brie", "provolone",
+        "asiago", "pepper jack", "monterey jack",
+        "yogurt", "greek yogurt", "kefir",
+        "egg", "eggs",
+    ]),
+    ("Bakery", [
+        "bread", "loaf", "baguette", "ciabatta", "sourdough", "bun",
+        "buns", "tortilla", "pita", "naan", "bagel", "roll", "rolls",
+        "english muffin", "croissant", "biscuits",
+    ]),
+    ("Frozen", [
+        "frozen", "ice cream", "popsicle", "frozen pizza",
+        "frozen vegetables", "frozen fruit",
+    ]),
+    ("Beverages", [
+        "coke", "diet coke", "pepsi", "soda", "sparkling water",
+        "seltzer", "juice", "lemonade", "milk alternative",
+        "almond milk", "oat milk", "soy milk", "coconut milk drink",
+        "wine", "beer", "cider", "champagne", "prosecco",
+        "coffee", "espresso", "tea", "matcha", "kombucha",
+        "energy drink", "gatorade", "powerade",
+    ]),
+    ("Snacks", [
+        "chip", "chips", "cracker", "crackers", "cookie", "cookies",
+        "pretzel", "popcorn", "granola bar", "trail mix",
+        "candy", "chocolate bar", "gum",
+    ]),
+    ("Pantry", [
+        # Baking
+        "flour", "all-purpose", "bread flour", "cake flour",
+        "sugar", "brown sugar", "powdered sugar", "confectioners",
+        "baking powder", "baking soda", "yeast", "cocoa",
+        "chocolate chip", "vanilla", "vanilla extract", "almond extract",
+        # Seasonings (dry)
+        "salt", "kosher salt", "sea salt", "black pepper",
+        "white pepper", "peppercorn", "cinnamon", "nutmeg",
+        "paprika", "cumin", "coriander", "cardamom", "clove",
+        "bay leaf", "red pepper flake", "chili powder",
+        "garlic powder", "onion powder", "italian seasoning",
+        "taco seasoning", "fajita seasoning", "old bay",
+        "everything bagel seasoning", "spice", "seasoning",
+        # Oils & vinegars
+        "olive oil", "vegetable oil", "canola oil", "sesame oil",
+        "avocado oil", "coconut oil", "oil",
+        "vinegar", "balsamic", "rice vinegar", "apple cider vinegar",
+        # Sauces & condiments
+        "ketchup", "mustard", "mayo", "mayonnaise", "soy sauce",
+        "worcestershire", "hot sauce", "sriracha", "bbq sauce",
+        "barbecue sauce", "salsa", "tomato sauce", "tomato paste",
+        "marinara", "pasta sauce", "pesto", "alfredo sauce",
+        "fish sauce", "oyster sauce", "hoisin", "teriyaki",
+        "salad dressing", "ranch dressing", "italian dressing",
+        "honey", "maple syrup", "syrup", "jam", "jelly",
+        "peanut butter", "almond butter", "nutella",
+        # Grains & legumes
+        "pasta", "spaghetti", "penne", "rigatoni", "fettuccine",
+        "linguine", "lasagna noodle", "noodle", "ramen", "udon",
+        "rice", "basmati", "jasmine", "wild rice", "quinoa",
+        "couscous", "barley", "oats", "oatmeal",
+        "bean", "lentil", "chickpea", "garbanzo", "kidney bean",
+        "black bean", "pinto bean",
+        # Canned & jarred
+        "canned", "can of", "broth", "stock", "bouillon",
+        "crushed tomatoes", "diced tomatoes", "tomato puree",
+        "coconut milk", "evaporated milk", "condensed milk",
+        "olives", "capers", "pickles",
+        # Nuts & seeds
+        "almond", "walnut", "pecan", "cashew", "pistachio", "peanut",
+        "pine nut", "sunflower seed", "pumpkin seed", "chia",
+        "flaxseed", "sesame seed",
+        # Misc dry
+        "cereal", "granola", "breadcrumb", "croutons", "stuffing",
+    ]),
+    ("Household", [
+        "paper towel", "toilet paper", "tissue", "napkin", "foil",
+        "plastic wrap", "parchment", "ziploc", "trash bag",
+        "dish soap", "laundry detergent", "bleach", "sponge",
+        "toothpaste", "toothbrush", "shampoo", "conditioner",
+        "soap", "deodorant",
+    ]),
+]
+
+# Precompiled longest-keyword-first patterns so multi-word phrases win
+# over single-word substrings: "baking soda" (Pantry) beats "soda"
+# (Beverages); "ice cream" (Frozen) beats "cream" (Dairy & Eggs);
+# "almond milk" (Beverages) beats "milk" (Dairy & Eggs). Tie-breaking on
+# equal-length keywords falls to source order via the stable sort.
+_CLASSIFIER_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE), cat)
+    for kw, cat in sorted(
+        ((kw, cat) for cat, kws in _CATEGORY_RULES for kw in kws),
+        key=lambda x: -len(x[0]),
+    )
+]
+
+
 def guess_category(name: str) -> str:
     """Lightweight keyword classifier so imported items don't all default
-    to 'Other'. Users can correct anything wrong on the edit page."""
-    n = name.lower()
-    rules = [
-        ("Produce", [
-            # Greens & lettuces
-            "arugula", "rocket", "lettuce", "romaine", "iceberg", "spinach",
-            "kale", "chard", "collard", "endive", "watercress", "frisee",
-            "radicchio", "mesclun", "microgreen", "sprouts",
-            # Herbs (fresh)
-            "basil", "parsley", "cilantro", "mint", "dill", "thyme",
-            "rosemary", "sage", "oregano", "tarragon", "chive", "scallion",
-            "green onion", "leek", "shallot",
-            # Cruciferous & alliums
-            "broccoli", "cauliflower", "cabbage", "brussels", "bok choy",
-            "onion", "garlic", "fennel",
-            # Roots & tubers
-            "potato", "sweet potato", "yam", "carrot", "beet", "turnip",
-            "parsnip", "radish", "ginger", "turmeric", "rutabaga",
-            "jicama", "kohlrabi",
-            # Squash family
-            "zucchini", "squash", "pumpkin", "cucumber", "eggplant",
-            # Peppers (fresh)
-            "bell pepper", "jalapeno", "jalapeño", "serrano", "habanero",
-            "poblano", "chili pepper", "chile pepper", "anaheim",
-            # Tomatoes (fresh)
-            "tomato", "cherry tomato", "grape tomato",
-            # Other vegetables
-            "celery", "asparagus", "artichoke", "okra", "snap pea",
-            "snow pea", "green bean", "pea pod", "corn on the cob",
-            "mushroom", "shiitake", "portobello", "cremini",
-            # Fruit
-            "apple", "banana", "orange", "lemon", "lime", "grapefruit",
-            "berry", "strawberry", "blueberry", "raspberry", "blackberry",
-            "grape", "melon", "watermelon", "cantaloupe", "honeydew",
-            "peach", "plum", "pear", "pineapple", "mango", "kiwi",
-            "papaya", "avocado", "cherry", "apricot", "fig", "date",
-            "pomegranate", "coconut", "fresh herb",
-        ]),
-        ("Meat & Seafood", [
-            "beef", "steak", "ribeye", "sirloin", "brisket", "filet",
-            "ground beef", "ground turkey", "ground pork", "ground chicken",
-            "chicken", "drumstick", "thigh", "wing", "breast",
-            "pork", "bacon", "ham", "prosciutto", "pancetta", "sausage",
-            "chorizo", "kielbasa", "hot dog", "pepperoni", "salami",
-            "turkey", "lamb", "veal", "duck",
-            "shrimp", "prawn", "fish", "salmon", "tuna", "cod", "tilapia",
-            "trout", "halibut", "scallop", "crab", "lobster", "clam",
-            "mussel", "oyster", "anchovy", "sardine",
-        ]),
-        ("Dairy & Eggs", [
-            "milk", "buttermilk", "half and half", "half-and-half",
-            "cream", "heavy cream", "sour cream", "whipping cream",
-            "butter", "ghee", "margarine",
-            "cheese", "parmesan", "mozzarella", "cheddar", "gouda",
-            "swiss cheese", "feta", "ricotta", "cottage cheese",
-            "cream cheese", "blue cheese", "brie", "provolone",
-            "asiago", "pepper jack", "monterey jack",
-            "yogurt", "greek yogurt", "kefir",
-            "egg", "eggs",
-        ]),
-        ("Bakery", [
-            "bread", "loaf", "baguette", "ciabatta", "sourdough", "bun",
-            "buns", "tortilla", "pita", "naan", "bagel", "roll", "rolls",
-            "english muffin", "croissant", "biscuits",
-        ]),
-        ("Frozen", [
-            "frozen", "ice cream", "popsicle", "frozen pizza",
-            "frozen vegetables", "frozen fruit",
-        ]),
-        ("Beverages", [
-            "coke", "diet coke", "pepsi", "soda", "sparkling water",
-            "seltzer", "juice", "lemonade", "milk alternative",
-            "almond milk", "oat milk", "soy milk", "coconut milk drink",
-            "wine", "beer", "cider", "champagne", "prosecco",
-            "coffee", "espresso", "tea", "matcha", "kombucha",
-            "energy drink", "gatorade", "powerade",
-        ]),
-        ("Snacks", [
-            "chip", "chips", "cracker", "crackers", "cookie", "cookies",
-            "pretzel", "popcorn", "granola bar", "trail mix",
-            "candy", "chocolate bar", "gum",
-        ]),
-        ("Pantry", [
-            # Baking
-            "flour", "all-purpose", "bread flour", "cake flour",
-            "sugar", "brown sugar", "powdered sugar", "confectioners",
-            "baking powder", "baking soda", "yeast", "cocoa",
-            "chocolate chip", "vanilla", "vanilla extract", "almond extract",
-            # Seasonings (dry)
-            "salt", "kosher salt", "sea salt", "black pepper",
-            "white pepper", "peppercorn", "cinnamon", "nutmeg",
-            "paprika", "cumin", "coriander", "cardamom", "clove",
-            "bay leaf", "red pepper flake", "chili powder",
-            "garlic powder", "onion powder", "italian seasoning",
-            "taco seasoning", "fajita seasoning", "old bay",
-            "everything bagel seasoning", "spice", "seasoning",
-            # Oils & vinegars
-            "olive oil", "vegetable oil", "canola oil", "sesame oil",
-            "avocado oil", "coconut oil", "oil",
-            "vinegar", "balsamic", "rice vinegar", "apple cider vinegar",
-            # Sauces & condiments
-            "ketchup", "mustard", "mayo", "mayonnaise", "soy sauce",
-            "worcestershire", "hot sauce", "sriracha", "bbq sauce",
-            "barbecue sauce", "salsa", "tomato sauce", "tomato paste",
-            "marinara", "pasta sauce", "pesto", "alfredo sauce",
-            "fish sauce", "oyster sauce", "hoisin", "teriyaki",
-            "salad dressing", "ranch dressing", "italian dressing",
-            "honey", "maple syrup", "syrup", "jam", "jelly",
-            "peanut butter", "almond butter", "nutella",
-            # Grains & legumes
-            "pasta", "spaghetti", "penne", "rigatoni", "fettuccine",
-            "linguine", "lasagna noodle", "noodle", "ramen", "udon",
-            "rice", "basmati", "jasmine", "wild rice", "quinoa",
-            "couscous", "barley", "oats", "oatmeal",
-            "bean", "lentil", "chickpea", "garbanzo", "kidney bean",
-            "black bean", "pinto bean",
-            # Canned & jarred
-            "canned", "can of", "broth", "stock", "bouillon",
-            "crushed tomatoes", "diced tomatoes", "tomato puree",
-            "coconut milk", "evaporated milk", "condensed milk",
-            "olives", "capers", "pickles",
-            # Nuts & seeds
-            "almond", "walnut", "pecan", "cashew", "pistachio", "peanut",
-            "pine nut", "sunflower seed", "pumpkin seed", "chia",
-            "flaxseed", "sesame seed",
-            # Misc dry
-            "cereal", "granola", "breadcrumb", "croutons", "stuffing",
-        ]),
-        ("Household", [
-            "paper towel", "toilet paper", "tissue", "napkin", "foil",
-            "plastic wrap", "parchment", "ziploc", "trash bag",
-            "dish soap", "laundry detergent", "bleach", "sponge",
-            "toothpaste", "toothbrush", "shampoo", "conditioner",
-            "soap", "deodorant",
-        ]),
-    ]
-    for category, words in rules:
-        for w in words:
-            if re.search(r"\b" + re.escape(w) + r"\b", n):
-                return category
+    to 'Other'. Users can correct anything wrong on the edit page.
+
+    Longest keyword wins, so "baking soda" → Pantry (not Beverages via
+    "soda"), "ice cream" → Frozen (not Dairy & Eggs via "cream"), and
+    "almond milk" → Beverages (not Dairy & Eggs via "milk")."""
+    if not name:
+        return "Other"
+    for pattern, category in _CLASSIFIER_PATTERNS:
+        if pattern.search(name):
+            return category
     return "Other"

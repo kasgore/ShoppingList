@@ -352,6 +352,37 @@ class TestNormalize:
     def test_normalize_name(self):
         assert normalize_name("  Chicken Breast  ") == "chicken breast"
 
+    # normalize_name strips a short list of redundant qualifiers so
+    # near-duplicates aggregate on the shopping list.
+    @pytest.mark.parametrize("raw,expected", [
+        ("Organic Brown Sugar", "brown sugar"),
+        ("organic brown sugar", "brown sugar"),
+        ("Granulated Sugar", "sugar"),
+        ("Organic Granulated Sugar", "sugar"),
+        ("Raw Honey", "honey"),
+        ("Pure Vanilla Extract", "vanilla extract"),
+        ("Fresh Basil", "basil"),
+        ("Extra-Virgin Olive Oil", "olive oil"),
+        ("Extra Virgin Olive Oil", "olive oil"),
+        ("Virgin Olive Oil", "olive oil"),
+        ("All-Purpose Flour", "flour"),
+        ("All Purpose Flour", "flour"),
+    ])
+    def test_normalize_name_strips_qualifiers(self, raw, expected):
+        assert normalize_name(raw) == expected
+
+    # ...but qualifiers that change what you'd actually buy are kept.
+    @pytest.mark.parametrize("raw,expected", [
+        ("Brown Sugar", "brown sugar"),       # color qualifier stays
+        ("White Sugar", "white sugar"),
+        ("Low-Sodium Soy Sauce", "low-sodium soy sauce"),
+        ("Bread Flour", "bread flour"),       # specific flour type stays
+        ("Almond Extract", "almond extract"),  # "extract" stays
+        ("Ground Ginger", "ground ginger"),   # form qualifier stays
+    ])
+    def test_normalize_name_keeps_meaningful_qualifiers(self, raw, expected):
+        assert normalize_name(raw) == expected
+
 
 # ---------------------------------------------------------------------------
 # guess_category
@@ -407,21 +438,168 @@ class TestGuessCategory:
         assert guess_category("CHICKEN BREAST") == "Meat & Seafood"
         assert guess_category("Spinach") == "Produce"
 
-    # Documented current limitations of the keyword-rule classifier:
-    # earlier-listed categories win over later ones when keywords overlap,
-    # and \b-anchored matches don't handle plurals. Listed here so future
-    # work to upgrade to embedding-based classification can target these.
-    def test_known_classifier_limitation_almond_milk_hits_dairy_first(self):
-        # Beverages list has "almond milk" but Dairy & Eggs has "milk"
-        # earlier in the rules → Dairy wins. To fix: ordered specificity
-        # (longer phrases beat shorter) or a real embedding classifier.
-        assert guess_category("almond milk") == "Dairy & Eggs"
+    # Longest-keyword-first dispatch fixes the rule-ordering surprises
+    # that an earlier keyword-rules-in-order classifier suffered from.
+    def test_longest_match_almond_milk_wins_beverages(self):
+        # "almond milk" (Beverages) beats "milk" (Dairy & Eggs).
+        assert guess_category("almond milk") == "Beverages"
 
-    def test_known_classifier_limitation_ice_cream_hits_dairy_first(self):
-        # "cream" matches in Dairy & Eggs before Frozen sees "ice cream".
-        assert guess_category("ice cream") == "Dairy & Eggs"
+    def test_longest_match_ice_cream_wins_frozen(self):
+        # "ice cream" (Frozen) beats "cream" (Dairy & Eggs).
+        assert guess_category("ice cream") == "Frozen"
+
+    def test_longest_match_baking_soda_wins_pantry(self):
+        # The bug that prompted this fix: "soda" → Beverages used to
+        # eat "baking soda" before Pantry got a turn.
+        assert guess_category("baking soda") == "Pantry"
 
     def test_known_classifier_limitation_plural_not_handled(self):
         # Bakery has "tortilla" but \btortilla\b doesn't match "tortillas"
         # → falls through to Pantry's "flour".
         assert guess_category("flour tortillas") == "Pantry"
+
+
+# ---------------------------------------------------------------------------
+# parse_ingredient — additional patches
+# ---------------------------------------------------------------------------
+
+class TestParseIngredientPatches:
+    # "3-inch piece fresh ginger" used to read 3 as the quantity and
+    # "-Inch Piece Fresh Ginger" as the name. Now we lift the size token.
+    def test_leading_size_inch_piece_ginger(self):
+        result = parse_ingredient(
+            "3-inch piece fresh ginger, peeled and finely minced"
+        )
+        # The leading "3" is no longer the quantity — defaults to 1.
+        assert result["quantity"] == 1.0
+        # "piece" is now a unit alias, so it gets pulled out cleanly.
+        assert result["unit"] == "piece"
+        # "fresh" is stripped by normalize_name when names are matched,
+        # but stays in the raw display name.
+        assert "ginger" in result["name"].lower()
+        assert "3-inch" in result["note"].lower()
+        # The comma-tail descriptor still lands in the note too.
+        assert "peeled" in result["note"].lower()
+
+    def test_leading_size_em_dash(self):
+        # En-dashes (–) from word-processor pastes also count.
+        result = parse_ingredient("2–pound roast")
+        assert result["quantity"] == 1.0
+        assert "2" in result["note"]
+        assert "pound" in result["note"].lower()
+        assert "roast" in result["name"].lower()
+
+    def test_dont_confuse_numeric_range_with_size(self):
+        # "1-2 cups flour" still parses as a range (qty=2), since "2"
+        # isn't a size-unit keyword.
+        result = parse_ingredient("1-2 cups flour")
+        assert result["quantity"] == 2.0
+        assert result["unit"] == "cup"
+
+    # "1 and ½ cups flour" — the connector word "and" used to keep the
+    # parser from seeing the mixed number.
+    @pytest.mark.parametrize("text,qty,unit", [
+        ("1 and ½ cups flour", 1.5, "cup"),
+        ("1 and 1/2 cups flour", 1.5, "cup"),
+        ("2 and ¾ tablespoons sugar", 2.75, "tbsp"),
+    ])
+    def test_and_between_number_and_fraction(self, text, qty, unit):
+        result = parse_ingredient(text)
+        assert result["quantity"] == pytest.approx(qty)
+        assert result["unit"] == unit
+
+    # Recipe-page footnote pointers ("Notes 1 and 2", "See 3") used to
+    # leak into the note field via the trailing-parenthetical lift.
+    @pytest.mark.parametrize("text", [
+        "3 medium overripe bananas (Notes 1 and 2)",
+        "1 cup flour (Note 1)",
+        "2 eggs (see 3)",
+        "1 onion (footnote 2)",
+    ])
+    def test_footnote_only_paren_is_dropped(self, text):
+        result = parse_ingredient(text)
+        # Whatever else lands in the note, the footnote ref shouldn't.
+        n = result["note"].lower()
+        assert "note" not in n
+        assert "see " not in n
+        assert "footnote" not in n
+
+    def test_real_trailing_paren_still_kept(self):
+        # The footnote filter shouldn't swallow legitimate parentheticals.
+        result = parse_ingredient("1 small garlic clove (1/2 medium)")
+        assert "1/2 medium" in result["note"]
+
+
+# ---------------------------------------------------------------------------
+# from_canonical — display unit selection
+# ---------------------------------------------------------------------------
+
+from ingredient import from_canonical, to_canonical_qty
+
+
+class TestFromCanonical:
+    def test_third_cup_displays_as_cup_not_tbsp(self):
+        # 1/3 cup ≈ 78.86 mL. Old breakpoints picked tbsp → "5 1/3 tbsp".
+        # The new selector picks cup → "1/3" of a cup.
+        _, base = to_canonical_qty(1 / 3, "cup")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "cup"
+        assert qty == pytest.approx(1 / 3, rel=1e-3)
+
+    def test_half_cup_displays_as_cup(self):
+        _, base = to_canonical_qty(0.5, "cup")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "cup"
+        assert qty == pytest.approx(0.5, rel=1e-3)
+
+    def test_three_tbsp_stays_as_tbsp(self):
+        # 3 tbsp = 3/16 cup — the cup display would be awkward, so tbsp
+        # is preferred.
+        _, base = to_canonical_qty(3, "tbsp")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "tbsp"
+        assert qty == pytest.approx(3, rel=1e-3)
+
+    def test_one_cup_displays_as_cup(self):
+        _, base = to_canonical_qty(1, "cup")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "cup"
+
+    def test_half_pound_displays_as_lb(self):
+        _, base = to_canonical_qty(0.5, "lb")  # type: ignore
+        qty, unit = from_canonical(base, "mass")
+        assert unit == "lb"
+        assert qty == pytest.approx(0.5, rel=1e-3)
+
+    def test_two_oz_displays_as_oz(self):
+        _, base = to_canonical_qty(2, "oz")  # type: ignore
+        qty, unit = from_canonical(base, "mass")
+        assert unit == "oz"
+
+    def test_two_tsp_stays_as_tsp(self):
+        # tsp→tbsp only promotes at v_tbsp >= 1, so 2 tsp doesn't become
+        # "2/3 tbsp" — a real regression we hit during the redesign.
+        _, base = to_canonical_qty(2, "tsp")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "tsp"
+        assert qty == pytest.approx(2.0, rel=1e-3)
+
+    def test_one_tsp_stays_as_tsp(self):
+        _, base = to_canonical_qty(1, "tsp")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "tsp"
+
+    def test_three_tsp_promotes_to_one_tbsp(self):
+        # 3 tsp = 1 tbsp exactly — at the boundary, the tbsp display wins.
+        _, base = to_canonical_qty(3, "tsp")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "tbsp"
+        assert qty == pytest.approx(1.0, rel=1e-3)
+
+    def test_one_and_a_half_cup_displays_as_cup(self):
+        # Mixed numbers in cup still beat the tbsp equivalent — "1 1/2 cup"
+        # not "24 tbsp".
+        _, base = to_canonical_qty(1.5, "cup")  # type: ignore
+        qty, unit = from_canonical(base, "volume")
+        assert unit == "cup"
+        assert qty == pytest.approx(1.5, rel=1e-3)
