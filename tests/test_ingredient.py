@@ -379,8 +379,84 @@ class TestNormalize:
         ("Bread Flour", "bread flour"),       # specific flour type stays
         ("Almond Extract", "almond extract"),  # "extract" stays
         ("Ground Ginger", "ground ginger"),   # form qualifier stays
+        ("Shredded Cheddar", "shredded cheddar"),  # product form stays
+        ("Frozen Corn", "frozen corn"),       # frozen ≠ fresh
+        ("Ground Beef", "ground beef"),       # form qualifier stays
     ])
     def test_normalize_name_keeps_meaningful_qualifiers(self, raw, expected):
+        assert normalize_name(raw) == expected
+
+    # Size adjectives are shopping-irrelevant — "large eggs" and "small
+    # onion" buy the same product as "eggs" and "onion".
+    @pytest.mark.parametrize("raw,expected", [
+        ("Large Eggs", "egg"),
+        ("Small Onion", "onion"),
+        ("Medium Tomato", "tomato"),
+        ("Jumbo Shrimp", "shrimp"),
+        ("Extra-Large Eggs", "egg"),
+        ("Extra Large Eggs", "egg"),
+    ])
+    def test_normalize_name_strips_size_adjectives(self, raw, expected):
+        assert normalize_name(raw) == expected
+
+    # Prep adjectives describe what the cook will do, not what to buy.
+    @pytest.mark.parametrize("raw,expected", [
+        ("Minced Garlic", "garlic"),
+        ("Chopped Fresh Cilantro", "cilantro"),
+        ("Diced Red Onion", "red onion"),
+        ("Sliced Scallions", "scallion"),
+        ("Grated Parmesan Cheese", "parmesan cheese"),
+        ("Freshly Grated Parmesan", "parmesan"),
+        ("Finely Chopped Onion", "onion"),
+        ("Thinly Sliced Almonds", "almond"),
+        ("Crushed Red Pepper", "red pepper"),
+    ])
+    def test_normalize_name_strips_prep_adjectives(self, raw, expected):
+        assert normalize_name(raw) == expected
+
+    # Singular/plural normalization so recipes that disagree on form
+    # ("egg" vs "eggs") still aggregate on the shopping list.
+    @pytest.mark.parametrize("raw,expected", [
+        ("Egg", "egg"),
+        ("Eggs", "egg"),
+        ("Avocados", "avocado"),
+        ("Roma Tomatoes", "roma tomato"),
+        ("Potatoes", "potato"),
+        ("Blueberries", "blueberry"),
+        ("Cherries", "cherry"),
+        ("Olives", "olive"),
+        ("Chives", "chive"),
+        ("Anchovies", "anchovy"),
+        ("Carrots", "carrot"),
+        ("Noodles", "noodle"),
+    ])
+    def test_normalize_name_singularizes(self, raw, expected):
+        assert normalize_name(raw) == expected
+
+    # Words that look plural but aren't — must not be stripped.
+    @pytest.mark.parametrize("raw,expected", [
+        ("Asparagus", "asparagus"),
+        ("Hummus", "hummus"),
+        ("Couscous", "couscous"),
+        ("Molasses", "molasses"),
+        ("Watercress", "watercress"),
+        ("Swiss Cheese", "swiss cheese"),
+        ("Brussels Sprouts", "brussels sprout"),  # only 'sprouts' is plural
+    ])
+    def test_normalize_name_singularize_exceptions(self, raw, expected):
+        assert normalize_name(raw) == expected
+
+    # Paste forms of garlic/ginger are functionally the same shopping
+    # item as the minced or whole form.
+    @pytest.mark.parametrize("raw,expected", [
+        ("Garlic Paste", "garlic"),
+        ("Ginger Paste", "ginger"),
+        ("Minced Garlic", "garlic"),
+        ("Minced Ginger", "ginger"),
+        # "Tomato paste" must NOT collapse — distinct product.
+        ("Tomato Paste", "tomato paste"),
+    ])
+    def test_normalize_name_paste_synonyms(self, raw, expected):
         assert normalize_name(raw) == expected
 
 

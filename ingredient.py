@@ -191,23 +191,96 @@ def from_canonical(qty_in_base: float, dimension: str) -> tuple[float, str]:
 # ingredient — stripped so "Organic Brown Sugar" merges with "Brown
 # Sugar". Curated conservatively: color qualifiers (white/brown sugar)
 # and dietary forms (low-sodium/reduced-fat) stay, because they change
-# what you'd actually buy.
+# what you'd actually buy. Note the deliberate omissions: 'ground'
+# (ground beef ≠ beef), 'shredded' (pre-shredded cheese is a product
+# form), and 'frozen' (frozen ≠ fresh at the store) are NOT stripped.
 _NAME_QUALIFIER_STRIP_RE = re.compile(
     r"\b("
-    r"organic|raw|pure|fresh|"
+    # Generic adjectives that don't change shopping identity.
+    r"organic|raw|pure|fresh(?:ly)?|"
+    # Oils.
     r"extra[- ]virgin|virgin|"
-    r"all[- ]purpose|granulated"
+    # Flour / sugar.
+    r"all[- ]purpose|granulated|"
+    # Size — irrelevant when picking an ingredient off a shopping list.
+    # extra-large/small spelled out so the hyphenated form is stripped
+    # cleanly instead of leaving "extra-" behind.
+    r"extra[- ]large|extra[- ]small|"
+    r"large|medium|small|big|little|jumbo|"
+    # Prep adjectives — these describe what the cook will do, not what
+    # to buy. "Minced garlic" buys the same jar/bulb as "garlic".
+    r"minced|chopped|diced|sliced|grated|crushed|"
+    r"finely|thinly|coarsely"
     r")\b",
     re.IGNORECASE,
 )
 
 
+# Words ending in 's' that are not plurals — leave alone or we get
+# nonsense like "asparagu" / "molass". Extend conservatively when a new
+# false positive shows up.
+_PLURAL_EXCEPTIONS = frozenset({
+    "asparagus", "hummus", "couscous", "molasses", "watercress",
+    "brussels", "swiss", "anise",
+})
+
+
+def _singularize_word(word: str) -> str:
+    """Best-effort singularization of one word. Errs toward leaving the
+    word alone — missed merges are fine, but turning "cheese" into
+    "chees" is not. Driven by suffix rules + a small exception set
+    rather than a dictionary because the latter would balloon the file
+    and still miss brand/variety names users invent."""
+    if len(word) <= 3:
+        return word
+    lw = word.lower()
+    if lw in _PLURAL_EXCEPTIONS:
+        return word
+    # Latin-style endings that look plural but aren't: "us" (asparagus,
+    # citrus, hummus), "is" (basis, oasis), "ss" (cress, dress-singular).
+    if lw.endswith(("us", "is", "ss")):
+        return word
+    # "berries" → "berry", "anchovies" → "anchovy".
+    if lw.endswith("ies") and len(lw) > 4:
+        return word[:-3] + "y"
+    # "tomatoes" → "tomato", "dishes" → "dish", "boxes" → "box",
+    # "kisses" → "kiss". For other -es words ("olives" → "olive",
+    # "chives" → "chive") strip just the trailing 's'.
+    if lw.endswith("es") and len(lw) > 4:
+        stem = lw[:-2]
+        if (
+            stem.endswith(("o", "x", "z"))
+            or stem.endswith(("ch", "sh", "ss"))
+        ):
+            return word[:-2]
+        return word[:-1]
+    if lw.endswith("s"):
+        return word[:-1]
+    return word
+
+
+# Functionally interchangeable names that recipes spell differently.
+# Applied AFTER qualifier-strip + singularize so the keys here are in
+# already-normalized form. Curated narrowly: "garlic paste" really is
+# the same shopping item as garlic (you can swap them 1:1 in any
+# recipe), but "tomato paste" / "miso paste" / "curry paste" are
+# distinct products and stay out of this map.
+_NAME_SYNONYMS = {
+    "garlic paste": "garlic",
+    "ginger paste": "ginger",
+}
+
+
 def normalize_name(name: str) -> str:
     """Lowercase and strip a short list of redundant qualifiers so
-    near-duplicates aggregate together on the shopping list."""
+    near-duplicates aggregate together on the shopping list. Also
+    singularizes per-word ("eggs" → "egg") and applies a tiny synonym
+    map so paste/minced forms merge."""
     n = name.strip().lower()
     n = _NAME_QUALIFIER_STRIP_RE.sub("", n)
-    return re.sub(r"\s+", " ", n).strip()
+    n = re.sub(r"\s+", " ", n).strip()
+    n = " ".join(_singularize_word(w) for w in n.split())
+    return _NAME_SYNONYMS.get(n, n)
 
 
 def format_quantity(qty: float) -> str:
