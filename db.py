@@ -11,7 +11,7 @@ from contextlib import closing
 
 from flask import g
 
-from ingredient import guess_category, normalize_name
+from ingredient import CATEGORIES, guess_category, normalize_name
 
 
 DB_PATH = os.environ.get(
@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS checked_item (
     key TEXT PRIMARY KEY
 );
 
+CREATE TABLE IF NOT EXISTS excluded_item (
+    -- Recipe-derived aggregated keys the user removed from the current
+    -- shopping list with the row's "×". (Ad-hoc removals just delete the
+    -- adhoc_item row.) build_shopping_list() skips any key listed here so
+    -- the item stays off the list until the list is cleared. Key format is
+    -- the same "recipe::..." shape build_shopping_list() produces.
+    key TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS meal_plan (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     plan_date  TEXT    NOT NULL,                       -- YYYY-MM-DD
@@ -121,6 +130,7 @@ CREATE TABLE IF NOT EXISTS pantry_item (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT    NOT NULL,
     normalized  TEXT    NOT NULL,
+    category    TEXT    NOT NULL DEFAULT 'Other',
     added_at    TEXT    DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_pantry_normalized ON pantry_item(normalized);
@@ -144,9 +154,15 @@ CREATE TABLE IF NOT EXISTS app_meta (
 """
 
 # Bump this whenever the rules in ingredient.guess_category() change.
-# init_db() will re-run the "Other" reclassification on the next start
-# only if the persisted value disagrees with this one.
-CLASSIFIER_VERSION = "2"
+# init_db() will re-run the reclassification on the next start only if the
+# persisted value disagrees with this one. The pass only re-guesses rows
+# that are unclassified ('Other') or stranded in a category that no longer
+# exists — it never overrides an item a user deliberately filed into a
+# still-valid aisle.
+#   "3": split the generic "Pantry" aisle into five granular ones.
+#   "4": plural-aware matching, "canned" override, and a big keyword
+#        expansion learned from a real household pantry.
+CLASSIFIER_VERSION = "4"
 
 
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
@@ -226,6 +242,29 @@ def init_db() -> None:
         for col, ddl in migrations:
             if col not in existing:
                 conn.execute(ddl)
+        # pantry_item gained a `category` column when the Pantry page got
+        # aisle sections. Older DBs need it backfilled from the classifier.
+        pantry_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(pantry_item)").fetchall()
+        }
+        if "category" not in pantry_cols:
+            conn.execute(
+                "ALTER TABLE pantry_item ADD COLUMN category "
+                "TEXT NOT NULL DEFAULT 'Other'"
+            )
+            for row in conn.execute("SELECT id, name FROM pantry_item").fetchall():
+                conn.execute(
+                    "UPDATE pantry_item SET category = ? WHERE id = ?",
+                    (guess_category(row[1]), row[0]),
+                )
+        # The "Bakery" aisle was renamed to "Bread/Wraps". Rename in place
+        # rather than re-guess, so a user's deliberate placements move over
+        # intact. Idempotent — a no-op once no rows match.
+        for table in ("ingredient", "adhoc_item", "pantry_item"):
+            conn.execute(
+                f"UPDATE {table} SET category = 'Bread/Wraps' "
+                "WHERE category = 'Bakery'"
+            )
         conn.commit()
         # Seed if empty.
         count = conn.execute("SELECT COUNT(*) FROM recipe").fetchone()[0]
@@ -233,22 +272,38 @@ def init_db() -> None:
             seed_recipes(conn)
             conn.commit()
 
-        # Re-classify any ingredient or ad-hoc item still sitting in 'Other'
-        # using the latest keyword rules. Skipped on subsequent boots when
-        # the persisted classifier_version matches CLASSIFIER_VERSION, so
-        # a 1000-row DB doesn't pay this cost on every container restart.
+        # Re-classify rows using the latest keyword rules — both items
+        # still sitting in 'Other' and items stranded in a category that no
+        # longer exists (e.g. the old generic 'Pantry' aisle, now split into
+        # Spices & Seasonings / Canned & Jarred / Dried Goods & Grains /
+        # Baking / Oils & Condiments). Skipped on subsequent boots when the
+        # persisted classifier_version matches CLASSIFIER_VERSION, so a
+        # 1000-row DB doesn't pay this cost on every container restart.
         stored_version_row = conn.execute(
             "SELECT value FROM app_meta WHERE key = 'classifier_version'"
         ).fetchone()
         stored_version = stored_version_row[0] if stored_version_row else ""
         if stored_version != CLASSIFIER_VERSION:
-            for table in ("ingredient", "adhoc_item"):
+            valid = set(CATEGORIES)
+            for table in ("ingredient", "adhoc_item", "pantry_item"):
+                # Recipe/ad-hoc rows come from imports, where 'Other' means
+                # "couldn't classify" — fair game to re-guess with newer
+                # rules. Pantry rows are always hand-added, so a deliberate
+                # 'Other' is a real choice; only re-aisle pantry rows that
+                # are stranded in a category that no longer exists.
+                reguess_other = table != "pantry_item"
                 rows = conn.execute(
-                    f"SELECT id, name FROM {table} WHERE category = 'Other'"
+                    f"SELECT id, name, category FROM {table}"
                 ).fetchall()
                 for row in rows:
+                    cat = row[2]
+                    # Skip rows that don't need touching: anything in a
+                    # still-valid aisle (never override a deliberate choice),
+                    # except 'Other' on tables where we re-guess it.
+                    if cat in valid and (cat != "Other" or not reguess_other):
+                        continue
                     guessed = guess_category(row[1])
-                    if guessed != "Other":
+                    if guessed != cat:
                         conn.execute(
                             f"UPDATE {table} SET category = ? WHERE id = ?",
                             (guessed, row[0]),
@@ -404,7 +459,7 @@ def seed_recipes(conn: sqlite3.Connection) -> None:
                 ("Chicken breast", 1.5, "lb", "Meat & Seafood"),
                 ("Bell pepper", 3, "", "Produce"),
                 ("Yellow onion", 1, "", "Produce"),
-                ("Flour tortillas", 8, "", "Bakery"),
+                ("Flour tortillas", 8, "", "Bread/Wraps"),
                 ("Fajita seasoning", 1, "pkg", "Pantry"),
                 ("Olive oil", 2, "tbsp", "Pantry"),
                 ("Lime", 2, "", "Produce"),
@@ -446,7 +501,7 @@ def seed_recipes(conn: sqlite3.Connection) -> None:
             "ingredients": [
                 ("Chicken breast", 2, "lb", "Meat & Seafood"),
                 ("BBQ sauce", 18, "oz", "Pantry"),
-                ("Brioche buns", 4, "", "Bakery"),
+                ("Brioche buns", 4, "", "Bread/Wraps"),
                 ("Coleslaw mix", 14, "oz", "Produce"),
                 ("Mayonnaise", 0.5, "cup", "Pantry"),
                 ("Apple cider vinegar", 2, "tbsp", "Pantry"),

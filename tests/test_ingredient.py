@@ -13,6 +13,7 @@ from ingredient import (
     normalize_name,
     normalize_unit,
     parse_ingredient,
+    significant_tokens,
 )
 
 
@@ -481,15 +482,29 @@ class TestGuessCategory:
         ("cheddar cheese", "Dairy & Eggs"),
         ("eggs", "Dairy & Eggs"),
         ("greek yogurt", "Dairy & Eggs"),
-        # Bakery
-        ("sourdough bread", "Bakery"),
-        ("bagel", "Bakery"),
-        # Pantry
-        ("flour", "Pantry"),
-        ("olive oil", "Pantry"),
-        ("crushed tomatoes", "Pantry"),
-        ("kosher salt", "Pantry"),
-        ("ketchup", "Pantry"),
+        # Bread/Wraps
+        ("sourdough bread", "Bread/Wraps"),
+        ("bagel", "Bread/Wraps"),
+        ("flour tortillas", "Bread/Wraps"),
+        # Baking
+        ("flour", "Baking"),
+        ("baking powder", "Baking"),
+        ("almond flour", "Baking"),
+        ("cornstarch", "Baking"),
+        # Oils & Condiments
+        ("olive oil", "Oils & Condiments"),
+        ("ketchup", "Oils & Condiments"),
+        ("peanut oil", "Oils & Condiments"),
+        # Canned & Jarred
+        ("crushed tomatoes", "Canned & Jarred"),
+        ("refried beans", "Canned & Jarred"),
+        # Spices & Seasonings
+        ("kosher salt", "Spices & Seasonings"),
+        ("dried oregano", "Spices & Seasonings"),
+        # Dried Goods & Grains
+        ("spaghetti", "Dried Goods & Grains"),
+        ("quinoa", "Dried Goods & Grains"),
+        ("dried black lentils", "Dried Goods & Grains"),
         # Frozen
         ("frozen pizza", "Frozen"),
         ("popsicle", "Frozen"),
@@ -524,15 +539,55 @@ class TestGuessCategory:
         # "ice cream" (Frozen) beats "cream" (Dairy & Eggs).
         assert guess_category("ice cream") == "Frozen"
 
-    def test_longest_match_baking_soda_wins_pantry(self):
+    def test_longest_match_baking_soda_wins_baking(self):
         # The bug that prompted this fix: "soda" → Beverages used to
-        # eat "baking soda" before Pantry got a turn.
-        assert guess_category("baking soda") == "Pantry"
+        # eat "baking soda" before the baking keywords got a turn.
+        assert guess_category("baking soda") == "Baking"
 
-    def test_known_classifier_limitation_plural_not_handled(self):
-        # Bakery has "tortilla" but \btortilla\b doesn't match "tortillas"
-        # → falls through to Pantry's "flour".
-        assert guess_category("flour tortillas") == "Pantry"
+    def test_plurals_are_matched(self):
+        # Keywords are plural-aware, so singular rules catch plural names.
+        assert guess_category("black beans") == "Dried Goods & Grains"
+        assert guess_category("potatoes") == "Produce"
+        assert guess_category("sweet potatoes") == "Produce"
+
+    def test_canned_overrides_keyword_aisle(self):
+        # An explicit "canned" wins over the aisle a keyword would pick:
+        # "tuna" (Meat) and "black beans" (Dried Goods) both go to cans.
+        assert guess_category("Tuna- Canned") == "Canned & Jarred"
+        assert guess_category("Black Beans- Canned") == "Canned & Jarred"
+        # ...but the un-canned forms keep their natural aisle.
+        assert guess_category("tuna steak") == "Meat & Seafood"
+
+
+# ---------------------------------------------------------------------------
+# significant_tokens — fuzzy pantry matching
+# ---------------------------------------------------------------------------
+
+class TestSignificantTokens:
+    def test_strips_form_size_and_punctuation(self):
+        # "Medium" is a size word; the trailing punctuation shouldn't block
+        # singularization of "noodles".
+        assert significant_tokens("Rice Noodles- Medium") == {"rice", "noodle"}
+
+    def test_matches_reordered_variants(self):
+        # The whole point: a pantry staple named differently than the recipe
+        # still shares its key food words.
+        recipe = significant_tokens("apple cider vinegar")
+        pantry = significant_tokens("Vinegar- Apple Cider")
+        assert recipe & pantry == {"apple", "cider", "vinegar"}
+
+    def test_singular_plural_overlap(self):
+        assert significant_tokens("black beans") & significant_tokens("Black Beans- Canned")
+
+    def test_color_only_overlap_is_not_a_match(self):
+        # "black pepper" vs "black beans" share only the color word, which
+        # is a stopword — so they must NOT be considered similar.
+        assert not (
+            significant_tokens("black pepper") & significant_tokens("black beans")
+        )
+
+    def test_connectives_and_units_dropped(self):
+        assert significant_tokens("1 cup of flour") == {"flour"}
 
 
 # ---------------------------------------------------------------------------

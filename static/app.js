@@ -129,7 +129,8 @@ function isHomePath() {
 //
 // When the shopping list changes — from another device, or from one of
 // our own .js-list-mutate forms — we patch just the affected regions of
-// the home page in place (#list-body, #quick-add-region, #on-list-region).
+// the home page in place (#list-body, #quick-add-region, #on-list-region,
+// #on-hand-region).
 // No full reload, so scroll position and anything half-typed in the cards
 // above survive. Events echoed back from *this* tab's own changes are
 // ignored (we already updated the DOM optimistically).
@@ -152,12 +153,16 @@ function applyHomeHtml(htmlText, opts) {
   swapInner("list-body");
   swapInner("quick-add-region");
   swapInner("on-list-region");
+  swapInner("on-hand-region");
   if (opts.flashes) {
     const fresh = doc.getElementById("flashes");
     const cur = document.getElementById("flashes");
     if (fresh && cur) { cur.innerHTML = fresh.innerHTML; scheduleFlashFade(); }
   }
   updateListCounters();
+  // Freshly-swapped sections are brand-new DOM — re-wire collapse toggles
+  // and restore each aisle's collapsed/expanded state.
+  if (window.__applyCollapsible) window.__applyCollapsible();
   return true;
 }
 
@@ -267,120 +272,55 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 })();
 
-// Toggle checkbox state via fetch so the page doesn't reload while shopping.
+// The row count under the heading (buy-list only — "already have on hand"
+// items live in #on-hand-region and shouldn't be counted here).
 function updateListCounters() {
-  const total = document.querySelectorAll(".item").length;
-  const checked = document.querySelectorAll(".item.checked").length;
-  const checkedEl = document.getElementById("list-checked");
-  if (checkedEl) checkedEl.textContent = String(checked);
+  const total = document.querySelectorAll("#list-body .item").length;
   const totalEl = document.getElementById("list-total");
   if (totalEl) totalEl.textContent = String(total);
-  const prog = document.getElementById("list-progress");
-  if (prog) { prog.max = Math.max(1, total); prog.value = checked; }
 }
 
+// "I have this" checkbox: checking saves the item to the pantry as a staple
+// (so it drops into "Already have on hand"), unchecking removes that staple
+// (pulling it back onto the buy list). Both relocate the row between
+// sections, so we re-render the home regions from the server after each
+// toggle rather than trying to animate the move client-side.
 document.addEventListener("change", async (e) => {
   const cb = e.target;
-  if (!cb.matches(".item .toggle")) return;
+  if (!cb.matches(".item .have-toggle")) return;
   const li = cb.closest(".item");
-  const key = li && li.dataset.key;
-  if (!key) return;
+  const name = li && li.dataset.name;
+  if (!name) return;
   const checked = cb.checked;
-  li.classList.toggle("checked", checked);
-  updateListCounters();
+  cb.disabled = true;
   try {
-    const r = await fetch("/list/toggle", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Client-Id": KASA_CLIENT_ID },
-      body: JSON.stringify({ key, checked }),
-    });
-    if (!r.ok) {
-      // Server reachable but unhappy — revert the optimistic state.
-      cb.checked = !checked;
-      li.classList.toggle("checked", cb.checked);
-      updateListCounters();
+    if (li.classList.contains("on-hand")) {
+      // "May already have on hand": checking means you've bought/confirmed
+      // it — save it to the pantry AND drop it from the list. (Boxes here
+      // start unchecked, so this only fires on check.)
+      if (!checked) return;
+      const r = await fetch("/list/bought", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Client-Id": KASA_CLIENT_ID },
+        body: JSON.stringify({ name, key: li.dataset.key }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    } else {
+      // Buy list: checking saves to the pantry (item relocates to the
+      // "may already have" section); unchecking removes that staple.
+      const r = await fetch("/list/pantry-toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Client-Id": KASA_CLIENT_ID },
+        body: JSON.stringify({ name, checked }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
     }
+    await refreshHomeFromServer();   // re-render so the item relocates/clears
   } catch (err) {
-    // Couldn't reach the server (a dead zone in the store, etc.) — keep
-    // the optimistic state and queue the change to replay when we're
-    // back online, rather than silently dropping it.
-    enqueueToggle(key, checked);
+    cb.checked = !checked;           // couldn't save — revert the box
+    cb.disabled = false;
   }
 });
-
-// ---------------------------------------------------------------------
-// Offline-resilient check-offs. When /list/toggle can't reach the server
-// we keep the optimistic state and stash the change here, then replay it
-// on the next `online` event or page load. (The Background Sync API
-// isn't available on iOS Safari, so this is the manual version.)
-// ---------------------------------------------------------------------
-const TOGGLE_QUEUE_KEY = "shoppinglist:pendingToggles";
-function loadToggleQueue() {
-  try { return JSON.parse(localStorage.getItem(TOGGLE_QUEUE_KEY)) || []; }
-  catch (e) { return []; }
-}
-function saveToggleQueue(q) {
-  try { localStorage.setItem(TOGGLE_QUEUE_KEY, JSON.stringify(q)); } catch (e) {}
-}
-function enqueueToggle(key, checked) {
-  const q = loadToggleQueue().filter((t) => t.key !== key);  // collapse to latest
-  q.push({ key, checked, ts: Date.now() });
-  saveToggleQueue(q);
-}
-let _flushingToggles = false;
-async function flushToggleQueue() {
-  if (_flushingToggles) return;
-  const snapshot = loadToggleQueue();
-  if (!snapshot.length) return;
-  _flushingToggles = true;
-  let synced = false;
-  try {
-    for (const t of snapshot) {
-      try {
-        const r = await fetch("/list/toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Client-Id": KASA_CLIENT_ID },
-          body: JSON.stringify({ key: t.key, checked: t.checked }),
-        });
-        if (!r.ok) break;  // server's there but unhappy — stop, retry later
-        // Drop just this exact entry; a fresh re-toggle would have a
-        // different ts and must survive.
-        saveToggleQueue(
-          loadToggleQueue().filter((x) => !(x.key === t.key && x.ts === t.ts))
-        );
-        synced = true;
-      } catch (e) {
-        break;  // still offline
-      }
-    }
-  } finally { _flushingToggles = false; }
-  if (synced && isHomePath()) refreshHomeFromServer();
-}
-window.addEventListener("online", flushToggleQueue);
-document.addEventListener("DOMContentLoaded", flushToggleQueue);
-
-// ---------------------------------------------------------------------
-// "Hide checked" toggle — collapses checked-off items so the list shrinks
-// to what's left as you shop. Preference persists in localStorage.
-// ---------------------------------------------------------------------
-(function setupHideChecked() {
-  const KEY = "shoppinglist:hideChecked";
-  const list = document.getElementById("list");
-  const btn = document.getElementById("hide-checked-toggle");
-  if (!list || !btn) return;
-  function apply(on) {
-    list.classList.toggle("hide-checked", on);
-    btn.setAttribute("aria-pressed", on ? "true" : "false");
-  }
-  let on = false;
-  try { on = localStorage.getItem(KEY) === "1"; } catch (e) {}
-  apply(on);
-  btn.addEventListener("click", () => {
-    on = !list.classList.contains("hide-checked");
-    apply(on);
-    try { localStorage.setItem(KEY, on ? "1" : "0"); } catch (e) {}
-  });
-})();
 
 // ---------------------------------------------------------------------
 // Flash messages auto-fade after a few seconds (errors linger longer).
@@ -470,44 +410,19 @@ function kasaFormatQty(qty) {
 })();
 
 // ---------------------------------------------------------------------
-// "Hide pantry" toggle — collapses recipe staples you keep stocked.
-// Default ON (the pantry feature only does anything once you've added
-// staples, and once you have, collapsing them is the point).
-// ---------------------------------------------------------------------
-(function setupHidePantry() {
-  const KEY = "shoppinglist:hidePantry";
-  const list = document.getElementById("list");
-  const btn = document.getElementById("hide-pantry-toggle");
-  if (!list || !btn) return;
-  function apply(on) {
-    list.classList.toggle("hide-pantry", on);
-    btn.setAttribute("aria-pressed", on ? "true" : "false");
-  }
-  let on = true;
-  try { on = localStorage.getItem(KEY) !== "0"; } catch (e) {}
-  apply(on);
-  btn.addEventListener("click", () => {
-    on = !list.classList.contains("hide-pantry");
-    apply(on);
-    try { localStorage.setItem(KEY, on ? "1" : "0"); } catch (e) {}
-  });
-})();
-
-// ---------------------------------------------------------------------
 // "Copy list" — plain-text shopping list to the clipboard (or share /
 // prompt fallback for plain-HTTP contexts where the Clipboard API is
 // unavailable).
 // ---------------------------------------------------------------------
 function buildShoppingListText() {
-  const list = document.getElementById("list");
-  const hidePantry = !!(list && list.classList.contains("hide-pantry"));
+  // Only the buy-list (#list-body) is copied — "already have on hand"
+  // items aren't things you need to shop for.
   const out = [];
   document.querySelectorAll("#list-body .cat-section").forEach((sec) => {
     const cat = (sec.querySelector(".cat") || {}).textContent || "";
     const rows = [];
     sec.querySelectorAll(".item").forEach((li) => {
       if (li.classList.contains("checked")) return;
-      if (hidePantry && li.classList.contains("pantry")) return;
       const qty = ((li.querySelector(".qty") || {}).textContent || "").replace(/\s+/g, " ").trim();
       const name = ((li.querySelector(".name") || {}).textContent || "").trim();
       const note = ((li.querySelector(".note") || {}).textContent || "").trim();
@@ -1030,3 +945,77 @@ document.addEventListener("submit", async (e) => {
     form.submit();
   }
 });
+
+// ---------------------------------------------------------------------
+// Collapsible aisle sections (shopping list + pantry). Tap a category
+// header to fold it away — handy once a section gets long. State is kept
+// per-category in localStorage and shared across both pages, and re-applied
+// after AJAX list swaps via window.__applyCollapsible (see applyHomeHtml).
+// ---------------------------------------------------------------------
+(function setupCollapsibleSections() {
+  const KEY = "shoppinglist:collapsedCats";
+  function load() {
+    try { return new Set(JSON.parse(localStorage.getItem(KEY) || "[]")); }
+    catch (e) { return new Set(); }
+  }
+  const collapsed = load();
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify([...collapsed])); }
+    catch (e) {}
+  }
+
+  function apply() {
+    document.querySelectorAll(".cat-section").forEach((sec) => {
+      const cat = sec.getAttribute("data-cat") || "";
+      const head = sec.querySelector("h3.cat");
+      if (head && !head.dataset.collapsible) {
+        head.dataset.collapsible = "1";
+        head.setAttribute("role", "button");
+        head.setAttribute("tabindex", "0");
+        const chev = document.createElement("span");
+        chev.className = "cat-chevron";
+        chev.setAttribute("aria-hidden", "true");
+        head.appendChild(chev);
+        const toggle = () => {
+          const isNow = sec.classList.toggle("collapsed");
+          if (isNow) collapsed.add(cat); else collapsed.delete(cat);
+          head.setAttribute("aria-expanded", isNow ? "false" : "true");
+          save();
+        };
+        head.addEventListener("click", toggle);
+        head.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); }
+        });
+      }
+      const isCollapsed = collapsed.has(cat);
+      sec.classList.toggle("collapsed", isCollapsed);
+      if (head) head.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+    });
+  }
+
+  window.__applyCollapsible = apply;
+  apply();
+})();
+
+// ---------------------------------------------------------------------
+// Proposed page: "More suggestions" reveals the next batch of pre-fetched
+// web recipe cards client-side — no extra API calls.
+// ---------------------------------------------------------------------
+(function setupWebMore() {
+  const btn = document.getElementById("web-more-btn");
+  const grid = document.getElementById("web-grid");
+  if (!btn || !grid) return;
+  const step = parseInt(btn.dataset.step, 10) || 12;
+  btn.addEventListener("click", () => {
+    const hidden = grid.querySelectorAll(".web-card.web-hidden");
+    for (let i = 0; i < step && i < hidden.length; i++) {
+      hidden[i].classList.remove("web-hidden");
+    }
+    const remaining = grid.querySelectorAll(".web-card.web-hidden").length;
+    if (remaining === 0) {
+      btn.remove();
+    } else {
+      btn.textContent = `More suggestions (${remaining} more)`;
+    }
+  });
+})();

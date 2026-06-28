@@ -107,22 +107,13 @@
       <h2>Shopping list</h2>
       <p class="muted">
         <span id="list-total">{{ total_items }}</span>
-        item{{ '' if total_items == 1 else 's' }} ·
-        <span id="list-checked">{{ checked_count }}</span> checked off
+        item{{ '' if total_items == 1 else 's' }} to buy ·
+        check <span aria-hidden="true">☑</span> what you have, or remove with
+        <span aria-hidden="true">×</span>
       </p>
-      <progress id="list-progress" class="list-progress"
-                max="{{ total_items if total_items else 1 }}"
-                value="{{ checked_count }}"
-                aria-label="Shopping progress"></progress>
     </div>
     <div class="actions">
       <button type="button" id="copy-list-btn" class="button">Copy list</button>
-      {% if has_pantry %}
-        <button type="button" id="hide-pantry-toggle" class="button"
-                aria-pressed="false">Hide pantry</button>
-      {% endif %}
-      <button type="button" id="hide-checked-toggle" class="button"
-              aria-pressed="false">Hide checked</button>
       <form action="{{ url_for('list_clear') }}" method="post" class="js-list-mutate"
             onsubmit="return confirm('Clear the entire shopping list?');">
         <input type="hidden" name="scope" value="all">
@@ -140,22 +131,29 @@
       <h3 class="cat">{{ category }}</h3>
       <ul class="items">
         {% for item in items %}
-          <li class="item {% if item.checked %}checked{% endif %}{% if item.in_pantry %} pantry{% endif %}" data-key="{{ item.key }}">
+          <li class="item" data-key="{{ item.key }}" data-name="{{ item.name }}">
             <label class="check">
-              <input type="checkbox" class="toggle" {% if item.checked %}checked{% endif %}>
+              <input type="checkbox" class="toggle have-toggle"
+                     {% if item.is_staple %}checked{% endif %}
+                     title="I have this — keep it in the pantry">
               <span class="qty">
                 {% if item.display_quantity %}{{ item.display_quantity }}{% endif %}
                 {% if item.unit %}{{ item.unit }}{% endif %}
               </span>
               <span class="name">{{ item.name }}</span>
-              {% if item.in_pantry %}<span class="pantry-tag" title="In your pantry — you probably already have this">🏠</span>{% endif %}
               {% if item.note %}<span class="note">— {{ item.note }}</span>{% endif %}
               <span class="sources">{{ item.sources|join(', ') }}</span>
             </label>
             {% if item.is_adhoc %}
               <form action="{{ url_for('list_remove_adhoc', adhoc_id=item.adhoc_id) }}"
                     method="post" class="inline js-list-mutate">
-                <button class="link" title="Remove">×</button>
+                <button class="link" title="Remove from list">×</button>
+              </form>
+            {% else %}
+              <form action="{{ url_for('list_exclude') }}"
+                    method="post" class="inline js-list-mutate">
+                <input type="hidden" name="key" value="{{ item.key }}">
+                <button class="link" title="Remove from list">×</button>
               </form>
             {% endif %}
           </li>
@@ -166,4 +164,49 @@
   {% endif %}
   </div>
 </section>
+
+{# "Already have on hand" — recipe ingredients that matched a pantry
+   staple. Pulled out of the buy-list so you can see at a glance what you
+   don't need to grab. Wrapper always present so the AJAX list handlers
+   can swap fresh contents in via id. #}
+<div id="on-hand-region">
+{% if on_hand %}
+<section class="card on-hand-card">
+  <header class="list-header">
+    <div class="list-header-meta">
+      <h2>May already have on hand <span class="on-hand-icon" aria-hidden="true">🏠</span></h2>
+      <p class="muted">
+        {{ on_hand|length }} item{{ '' if on_hand|length == 1 else 's' }} matched
+        to your pantry — you may already have {{ 'it' if on_hand|length == 1 else 'these' }}.
+        Check one once you've bought it to save it to your pantry, or
+        <span aria-hidden="true">×</span> to just take it off this list.
+        Manage staples on the <a href="{{ url_for('pantry_page') }}">Pantry</a> page.
+      </p>
+    </div>
+  </header>
+  <ul class="items on-hand-items">
+    {% for item in on_hand %}
+      <li class="item on-hand" data-key="{{ item.key }}" data-name="{{ item.name }}">
+        <label class="check">
+          <input type="checkbox" class="toggle have-toggle"
+                 title="Bought it — save to the pantry">
+          <span class="qty">
+            {% if item.display_quantity %}{{ item.display_quantity }}{% endif %}
+            {% if item.unit %}{{ item.unit }}{% endif %}
+          </span>
+          <span class="name">{{ item.name }}</span>
+          {% if item.note %}<span class="note">— {{ item.note }}</span>{% endif %}
+          <span class="sources">{{ item.sources|join(', ') }}</span>
+        </label>
+        <form action="{{ url_for('list_exclude') }}"
+              method="post" class="inline js-list-mutate">
+          <input type="hidden" name="key" value="{{ item.key }}">
+          <button class="link" title="Remove from list">×</button>
+        </form>
+      </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+</div>
 {% endblock %}

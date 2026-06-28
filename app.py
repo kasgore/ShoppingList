@@ -2,6 +2,7 @@
 a consolidated shopping list with ad-hoc additions."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -42,6 +43,7 @@ from ingredient import (
     normalize_name,
     normalize_unit,
     parse_ingredient,
+    significant_tokens,
     to_canonical_qty,
 )
 from ocr import _ocr_image_to_text, _parse_ocr_recipe
@@ -89,6 +91,7 @@ class AggregatedItem:
     adhoc_id: int | None = None
     checked: bool = False
     in_pantry: bool = False
+    is_staple: bool = False
 
     @property
     def display_quantity(self) -> str:
@@ -202,27 +205,41 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
             adhoc_id=a["id"],
         )
 
-    # Apply checked state.
-    checked_keys = {
-        row["key"] for row in db.execute("SELECT key FROM checked_item").fetchall()
+    # Drop recipe items the user removed from the list with the row "×".
+    excluded_keys = {
+        row["key"] for row in db.execute("SELECT key FROM excluded_item").fetchall()
     }
-    # Flag recipe-derived items the family keeps stocked (the pantry). Ad-hoc
-    # adds are never auto-flagged — you asked for it, so presumably you need it.
-    pantry_norms = {
-        row[0] for row in db.execute("SELECT normalized FROM pantry_item").fetchall()
-    }
-    for item in bucket.values():
-        item.checked = item.key in checked_keys
-        if not item.is_adhoc and pantry_norms:
-            item.in_pantry = normalize_name(item.name) in pantry_norms
+    for key in list(bucket):
+        if key in excluded_keys:
+            del bucket[key]
 
-    # Group by category, preserving the configured order. Within a category:
-    # unchecked-not-pantry first, then pantry staples, then checked items.
+    # Pantry matching. `is_staple` is an exact normalized-name match (drives
+    # the row's checkbox state). `in_pantry` is the fuzzy match that pulls a
+    # recipe item into "Already have on hand": an item counts as on-hand if
+    # it shares any meaningful food word with *any* pantry staple — so
+    # "rice noodles" matches a "Rice Noodles- Medium" staple, and once you
+    # save staples they catch the many ways recipes name the same thing.
+    # Ad-hoc adds are never auto-hidden — you asked for it, so you need it.
+    pantry_rows = db.execute(
+        "SELECT normalized, name FROM pantry_item"
+    ).fetchall()
+    pantry_norms = {row["normalized"] for row in pantry_rows}
+    pantry_vocab: set[str] = set()
+    for row in pantry_rows:
+        pantry_vocab |= significant_tokens(row["name"])
+    for item in bucket.values():
+        norm = normalize_name(item.name)
+        item.is_staple = norm in pantry_norms
+        if not item.is_adhoc and pantry_vocab:
+            item.in_pantry = bool(significant_tokens(item.name) & pantry_vocab)
+
+    # Group by category, preserving the configured order; alphabetical
+    # within each category.
     grouped: dict[str, list[AggregatedItem]] = defaultdict(list)
     for item in bucket.values():
         grouped[item.category].append(item)
     for items in grouped.values():
-        items.sort(key=lambda i: (i.checked, i.in_pantry, i.name))
+        items.sort(key=lambda i: i.name.lower())
 
     ordered: dict[str, list[AggregatedItem]] = {}
     for cat in CATEGORIES:
@@ -233,6 +250,230 @@ def build_shopping_list(db: sqlite3.Connection) -> dict[str, list[AggregatedItem
         if cat not in ordered:
             ordered[cat] = items
     return ordered
+
+
+def split_on_hand(
+    grouped: dict[str, list[AggregatedItem]],
+) -> tuple[dict[str, list[AggregatedItem]], list[AggregatedItem]]:
+    """Split an aggregated shopping list into the things you still need to
+    buy and the things the pantry says you already have.
+
+    Returns `(to_buy, on_hand)`:
+      * `to_buy`  – the same category→items mapping, minus pantry staples,
+                    with now-empty categories dropped.
+      * `on_hand` – a flat, name-sorted list of the recipe-derived items
+                    that matched a pantry staple ("already have on hand").
+
+    Ad-hoc items are never flagged in_pantry, so they always stay in
+    `to_buy` — you asked for it, so presumably you need it.
+    """
+    to_buy: dict[str, list[AggregatedItem]] = {}
+    on_hand: list[AggregatedItem] = []
+    for cat, items in grouped.items():
+        keep = [i for i in items if not i.in_pantry]
+        on_hand.extend(i for i in items if i.in_pantry)
+        if keep:
+            to_buy[cat] = keep
+    on_hand.sort(key=lambda i: i.name.lower())
+    return to_buy, on_hand
+
+
+# Aisles whose items are assumed always-stocked basics, so a recipe that
+# needs one isn't counted as "missing" on the Proposed page. (User choice:
+# don't nag about salt / oil / spices / flour.)
+STAPLE_AISLES = {"Spices & Seasonings", "Oils & Condiments", "Baking"}
+
+# Pantry aisles worth sending to the web recipe search — real recipe
+# ingredients, not paper towels, soda, or chips.
+WEB_SEARCH_AISLES = {
+    "Produce", "Meat & Seafood", "Dairy & Eggs", "Canned & Jarred",
+    "Dried Goods & Grains", "Frozen", "Bread/Wraps",
+}
+
+
+def _pantry_token_sets(db: sqlite3.Connection) -> list[set[str]]:
+    """Significant-token set for each pantry staple, used for *precise*
+    coverage on the Proposed page. (The shopping list deliberately uses a
+    looser whole-pantry-vocabulary match; here we want coverage to mean
+    something, so each ingredient is checked against individual staples.)"""
+    sets = []
+    for row in db.execute("SELECT name FROM pantry_item").fetchall():
+        toks = significant_tokens(row["name"])
+        if toks:
+            sets.append(toks)
+    return sets
+
+
+def _covered_by_pantry(ing_tokens: set[str], pantry_sets: list[set[str]]) -> bool:
+    """True if some pantry staple plausibly *is* this ingredient: one token
+    set contains the other. So "rice" ↔ "Rice- White" and "tofu" ↔ "Silken
+    Tofu" match, but "chicken breast" does NOT match "Chicken Rub" (neither
+    is a subset of the other)."""
+    if not ing_tokens:
+        return False
+    for pset in pantry_sets:
+        if ing_tokens <= pset or pset <= ing_tokens:
+            return True
+    return False
+
+
+def propose_from_recipes(db: sqlite3.Connection, limit: int = 40) -> list[dict]:
+    """Rank the user's saved recipes by how much of each the pantry already
+    covers. "missing" lists only real shopping items — ingredients in a
+    staple aisle (salt/oil/spices/flour) are assumed on hand and never
+    counted missing. Recipes that need the least shopping float to the top."""
+    pantry_sets = _pantry_token_sets(db)
+
+    ings_by_recipe: dict[int, list] = defaultdict(list)
+    for ing in db.execute(
+        "SELECT recipe_id, name, category FROM ingredient ORDER BY recipe_id, id"
+    ).fetchall():
+        ings_by_recipe[ing["recipe_id"]].append(ing)
+
+    proposals: list[dict] = []
+    for r in db.execute(
+        "SELECT id, name, image_url, servings, total_time, category FROM recipe"
+    ).fetchall():
+        ings = ings_by_recipe.get(r["id"], [])
+        if not ings:
+            continue
+        missing: list[str] = []
+        for ing in ings:
+            toks = significant_tokens(ing["name"])
+            if not toks or toks <= {"water", "ice"}:
+                continue  # water/ice (and unparseable names) are free
+            if _covered_by_pantry(toks, pantry_sets):
+                continue  # pantry covers it
+            cat = ing["category"] or guess_category(ing["name"])
+            if cat in STAPLE_AISLES:
+                continue  # assume the basics are always on hand
+            missing.append(ing["name"].strip().title())
+        total = len(ings)
+        proposals.append({
+            "id": r["id"],
+            "name": r["name"],
+            "image_url": r["image_url"],
+            "servings": r["servings"],
+            "total_time": r["total_time"],
+            "category": r["category"],
+            "total": total,
+            "have": total - len(missing),
+            "coverage": (total - len(missing)) / total if total else 0.0,
+            "missing": missing,
+            "missing_count": len(missing),
+        })
+    # Fewest still-to-buy first, then best coverage, then name.
+    proposals.sort(
+        key=lambda p: (p["missing_count"], -p["coverage"], p["name"].lower())
+    )
+    return proposals[:limit]
+
+
+# Cached web suggestions, keyed on the pantry signature, so repeated visits
+# don't burn the (limited) daily Spoonacular quota — only a pantry change
+# triggers a fresh query.
+_web_proposals_cache: dict = {}
+
+
+def _resolve_spoonacular_key() -> str:
+    """API key for web recipe suggestions. Prefers the SPOONACULAR_API_KEY
+    env var; falls back to a `.spoonacular_key` file next to the DB. The
+    file is gitignored (like `.secret_key`) so the key never lands in
+    source control."""
+    env = os.environ.get("SPOONACULAR_API_KEY", "").strip()
+    if env:
+        return env
+    try:
+        with open(
+            os.path.join(os.path.dirname(DB_PATH), ".spoonacular_key"),
+            "r", encoding="ascii",
+        ) as f:
+            return f.read().strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def propose_from_web(db: sqlite3.Connection, limit: int = 48):
+    """Suggest internet recipes that use what's on hand, via Spoonacular's
+    "find by ingredients" API. Returns None when no API key is configured
+    (the feature stays dormant), otherwise a — possibly empty — list. Always
+    degrades quietly: network errors or quota payloads yield an empty list,
+    never an exception, so the page still renders the local suggestions.
+
+    We fetch a generous batch in one (cheap) call and let the page reveal
+    them 12 at a time client-side, so the "More" button costs no extra API
+    quota."""
+    key = _resolve_spoonacular_key()
+    if not key:
+        return None
+    mains = [
+        row["name"]
+        for row in db.execute(
+            "SELECT name, category FROM pantry_item ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        if row["category"] in WEB_SEARCH_AISLES
+    ][:25]
+    if not mains:
+        return []
+    sig = tuple(mains)
+    if sig in _web_proposals_cache:
+        return _web_proposals_cache[sig]
+
+    from urllib.parse import quote
+    # ranking=1 → maximize how many of *your* ingredients a recipe uses
+    # (a "cook from my pantry" feel), rather than ranking=2 which minimizes
+    # missing items and tends to surface near-empty recipes.
+    url = (
+        "https://api.spoonacular.com/recipes/findByIngredients"
+        "?number=%d&ranking=1&ignorePantry=true&ingredients=%s&apiKey=%s"
+        % (limit, quote(",".join(mains)), quote(key))
+    )
+    fetched = _http_get(
+        url, timeout=12.0, retries=2, extra_headers={"Accept": "application/json"}
+    )
+    if fetched is None:
+        return []
+    body, _ = fetched
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, AttributeError):
+        return []
+    if not isinstance(data, list):
+        return []  # an error/quota object rather than results — show none
+
+    # Spoonacular only knows the ~25 mains we sent it, so it lists your
+    # staples (taco seasoning, cumin, garlic powder…) as "missing". Re-filter
+    # each recipe's missing list through your *full* pantry and the staple
+    # rules — same as the local section — so "need" shows only real gaps.
+    pantry_sets = _pantry_token_sets(db)
+    out: list[dict] = []
+    for item in data:
+        rid = item.get("id")
+        title = (item.get("title") or "").strip()
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        missing: list[str] = []
+        for m in item.get("missedIngredients") or []:
+            nm = (m.get("name") or "").strip()
+            toks = significant_tokens(nm)
+            if not nm or not toks or toks <= {"water", "ice"}:
+                continue
+            if _covered_by_pantry(toks, pantry_sets):
+                continue  # you actually have it
+            if guess_category(nm) in STAPLE_AISLES:
+                continue  # assumed-on-hand basic
+            missing.append(nm.title())
+        out.append({
+            "title": title,
+            "image": item.get("image") or "",
+            "used": item.get("usedIngredientCount") or 0,
+            "missed": len(missing),
+            "missing": missing,
+            "url": f"https://spoonacular.com/recipes/{slug}-{rid}" if rid else "",
+        })
+    # Surface the recipes you can most nearly make first.
+    out.sort(key=lambda w: (w["missed"], -w["used"]))
+    _web_proposals_cache[sig] = out
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -351,22 +592,6 @@ def _write_full_backup_zip(zip_path: str) -> tuple[int, int]:
         except OSError:
             pass
     return photo_count, total_bytes
-
-
-def _week_start(d: date) -> date:
-    """Return the Sunday on or before `d`. Weeks run Sun → Sat."""
-    # weekday(): Mon=0…Sun=6. Days back to Sunday = (weekday + 1) % 7.
-    return d - timedelta(days=(d.weekday() + 1) % 7)
-
-
-def _parse_iso_date(s: str | None) -> date:
-    """Parse YYYY-MM-DD; fall back to today on bad input."""
-    if not s:
-        return date.today()
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        return date.today()
 
 
 def _parse_multiplier_field(
@@ -1342,19 +1567,35 @@ def create_app() -> Flask:
             "ORDER BY lr.added_at"
         ).fetchall()
         grouped = build_shopping_list(db)
-        total_items = sum(len(v) for v in grouped.values())
-        checked_count = sum(1 for items in grouped.values() for i in items if i.checked)
+        # Pull pantry staples out into their own "already have on hand"
+        # list so they don't clutter what you actually need to buy.
+        to_buy, on_hand = split_on_hand(grouped)
+        total_items = sum(len(v) for v in to_buy.values())
         quick_add = _top_predicted_items_cached(db, limit=8)
-        has_pantry = db.execute("SELECT COUNT(*) FROM pantry_item").fetchone()[0] > 0
         return render_template(
             "index.html",
             recipes=recipes,
             active_recipes=active_recipes,
-            grouped=grouped,
+            grouped=to_buy,
+            on_hand=on_hand,
             categories=CATEGORIES,
             total_items=total_items,
-            checked_count=checked_count,
             quick_add=quick_add,
+        )
+
+    @app.route("/proposed")
+    def proposed_page():
+        db = get_db()
+        from_recipes = propose_from_recipes(db)
+        from_web = propose_from_web(db)   # None when no API key is set
+        has_pantry = (
+            db.execute("SELECT COUNT(*) FROM pantry_item").fetchone()[0] > 0
+        )
+        return render_template(
+            "proposed.html",
+            from_recipes=from_recipes,
+            from_web=from_web,
+            web_enabled=from_web is not None,
             has_pantry=has_pantry,
         )
 
@@ -2050,8 +2291,18 @@ def create_app() -> Flask:
     def pantry_page():
         db = get_db()
         items = db.execute(
-            "SELECT id, name FROM pantry_item ORDER BY name COLLATE NOCASE"
+            "SELECT id, name, category FROM pantry_item "
+            "ORDER BY name COLLATE NOCASE"
         ).fetchall()
+        # Group into aisle sections, ordered like the shopping list. Items
+        # arrive already name-sorted, so each section is alphabetical.
+        # Any legacy/unknown category lands under "Other".
+        grouped: dict[str, list] = defaultdict(list)
+        for it in items:
+            cat = it["category"] if it["category"] in CATEGORIES else "Other"
+            grouped[cat].append(it)
+        grouped_items = {cat: grouped[cat] for cat in CATEGORIES if cat in grouped}
+
         pantry_norms = {normalize_name(r["name"]) for r in items}
         # Recipe-derived names currently on the shopping list that aren't
         # pantry staples yet — surface them as one-tap "add to pantry".
@@ -2067,7 +2318,13 @@ def create_app() -> Flask:
                 seen.add(norm)
                 candidates.append(it.name)
         candidates.sort(key=str.lower)
-        return render_template("pantry.html", items=items, candidates=candidates)
+        return render_template(
+            "pantry.html",
+            grouped_items=grouped_items,
+            total_items=len(items),
+            candidates=candidates,
+            categories=CATEGORIES,
+        )
 
     @app.post("/pantry/add")
     def pantry_add():
@@ -2082,13 +2339,32 @@ def create_app() -> Flask:
         ).fetchone():
             flash(f"{name} is already in your pantry.", "error")
             return redirect(url_for("pantry_page"))
+        # Auto-guess the aisle from the name; honor an explicit category if
+        # one was submitted (e.g. the "add to pantry" chips could pass it).
+        submitted = request.form.get("category", "").strip()
+        category = submitted if submitted in CATEGORIES else guess_category(name)
         db.execute(
-            "INSERT INTO pantry_item (name, normalized) VALUES (?, ?)",
-            (name, norm),
+            "INSERT INTO pantry_item (name, normalized, category) VALUES (?, ?, ?)",
+            (name, norm, category),
         )
         db.commit()
         _list_changed()   # pantry flags on the shopping list change
         flash(f"Added {name} to your pantry.", "success")
+        return redirect(url_for("pantry_page"))
+
+    @app.post("/pantry/<int:item_id>/category")
+    def pantry_set_category(item_id: int):
+        """Re-file a pantry item into a different aisle section."""
+        category = request.form.get("category", "").strip()
+        if category not in CATEGORIES:
+            flash("Unknown section.", "error")
+            return redirect(url_for("pantry_page"))
+        db = get_db()
+        db.execute(
+            "UPDATE pantry_item SET category = ? WHERE id = ?",
+            (category, item_id),
+        )
+        db.commit()
         return redirect(url_for("pantry_page"))
 
     @app.post("/pantry/<int:item_id>/delete")
@@ -2099,137 +2375,6 @@ def create_app() -> Flask:
         _list_changed()
         flash("Removed from pantry.", "success")
         return redirect(url_for("pantry_page"))
-
-    # ---- Shopping list actions -----------------------------------------
-
-    @app.route("/plan")
-    def plan_page():
-        week_param = request.args.get("week", "")
-        today = date.today()
-        week_start = _week_start(_parse_iso_date(week_param) if week_param else today)
-        days = [week_start + timedelta(days=i) for i in range(7)]
-
-        db = get_db()
-        rows = db.execute(
-            "SELECT mp.id, mp.plan_date, mp.slot, mp.recipe_id, mp.text_plan, "
-            "       mp.multiplier, mp.sort_order, r.name AS recipe_name "
-            "FROM meal_plan mp "
-            "LEFT JOIN recipe r ON r.id = mp.recipe_id "
-            "WHERE mp.plan_date >= ? AND mp.plan_date <= ? "
-            "ORDER BY mp.plan_date, mp.sort_order, mp.id",
-            (days[0].isoformat(), days[6].isoformat()),
-        ).fetchall()
-
-        by_date = defaultdict(list)
-        for r in rows:
-            by_date[r["plan_date"]].append(r)
-
-        recipes = db.execute(
-            "SELECT id, name FROM recipe ORDER BY name COLLATE NOCASE"
-        ).fetchall()
-
-        prev_week = week_start - timedelta(days=7)
-        next_week = week_start + timedelta(days=7)
-        week_end = week_start + timedelta(days=6)
-
-        return render_template(
-            "plan.html",
-            days=days,
-            by_date=by_date,
-            recipes=recipes,
-            today=today,
-            week_start=week_start,
-            week_end=week_end,
-            prev_week=prev_week.isoformat(),
-            next_week=next_week.isoformat(),
-            this_week_iso=_week_start(today).isoformat(),
-        )
-
-    @app.post("/plan/add")
-    def plan_add():
-        plan_date_raw = request.form.get("plan_date", "").strip()
-        slot = request.form.get("slot", "").strip()[:40]
-        recipe_id_raw = request.form.get("recipe_id", "").strip()
-        text_plan = request.form.get("text_plan", "").strip()[:200]
-        multiplier_raw = request.form.get("multiplier", "1").strip() or "1"
-
-        try:
-            datetime.strptime(plan_date_raw, "%Y-%m-%d")
-        except ValueError:
-            flash("Invalid date.", "error")
-            return redirect(url_for("plan_page"))
-
-        multiplier = _parse_multiplier_field(
-            multiplier_raw, floor=0.1, cap=MAX_MULTIPLIER
-        )
-
-        recipe_id = None
-        if recipe_id_raw:
-            try:
-                recipe_id = int(recipe_id_raw)
-            except ValueError:
-                recipe_id = None
-
-        if not recipe_id and not text_plan:
-            flash("Pick a recipe or type a quick plan.", "error")
-            return redirect(url_for("plan_page", week=plan_date_raw))
-
-        db = get_db()
-        db.execute(
-            "INSERT INTO meal_plan (plan_date, slot, recipe_id, text_plan, multiplier) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (
-                plan_date_raw,
-                slot,
-                recipe_id,
-                text_plan if not recipe_id else "",
-                multiplier,
-            ),
-        )
-        db.commit()
-        return redirect(url_for("plan_page", week=plan_date_raw))
-
-    @app.post("/plan/<int:plan_id>/remove")
-    def plan_remove(plan_id: int):
-        db = get_db()
-        row = db.execute(
-            "SELECT plan_date FROM meal_plan WHERE id = ?", (plan_id,)
-        ).fetchone()
-        week = row["plan_date"] if row else ""
-        db.execute("DELETE FROM meal_plan WHERE id = ?", (plan_id,))
-        db.commit()
-        return redirect(url_for("plan_page", week=week))
-
-    @app.post("/plan/add-week-to-list")
-    def plan_add_week_to_list():
-        week_raw = request.form.get("week", "").strip()
-        week_start = _week_start(_parse_iso_date(week_raw))
-        week_end = week_start + timedelta(days=6)
-
-        db = get_db()
-        rows = db.execute(
-            "SELECT recipe_id, multiplier FROM meal_plan "
-            "WHERE plan_date BETWEEN ? AND ? AND recipe_id IS NOT NULL",
-            (week_start.isoformat(), week_end.isoformat()),
-        ).fetchall()
-
-        if not rows:
-            flash("No recipes planned for this week.", "error")
-            return redirect(url_for("plan_page", week=week_start.isoformat()))
-
-        for r in rows:
-            db.execute(
-                "INSERT INTO list_recipe (recipe_id, multiplier, added_by) "
-                "VALUES (?, ?, ?)",
-                (r["recipe_id"], r["multiplier"], "Plan"),
-            )
-        db.commit()
-        _list_changed()
-        flash(
-            f"Added {len(rows)} planned recipe(s) to the shopping list.",
-            "success",
-        )
-        return redirect(url_for("index", _anchor="list"))
 
     @app.route("/backup")
     def backup_page():
@@ -2673,6 +2818,93 @@ def create_app() -> Flask:
         flash("Item removed.", "success")
         return redirect(url_for("index", _anchor="list"))
 
+    @app.route("/list/exclude", methods=["POST"])
+    def list_exclude():
+        """The row "×" on a recipe-derived item: drop just that item from
+        the current list. Recorded as an exclusion (the recipe itself is
+        untouched) so it stays off until the list is cleared."""
+        key = request.form.get("key", "").strip()
+        if not key:
+            flash("Could not remove that item.", "error")
+            return redirect(url_for("index", _anchor="list"))
+        db = get_db()
+        db.execute("INSERT OR IGNORE INTO excluded_item (key) VALUES (?)", (key,))
+        db.commit()
+        _list_changed()
+        flash("Item removed from the list.", "success")
+        return redirect(url_for("index", _anchor="list"))
+
+    @app.route("/list/bought", methods=["POST"])
+    def list_bought():
+        """The checkbox in "May already have on hand": you've bought/confirmed
+        the item, so save it to the pantry as a staple (with a purchase
+        signal) and drop it from the current list."""
+        if request.is_json:
+            name = (request.json.get("name") or "").strip()
+            key = (request.json.get("key") or "").strip()
+        else:
+            name = request.form.get("name", "").strip()
+            key = request.form.get("key", "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "missing name"}), 400
+        db = get_db()
+        norm = normalize_name(name)
+        if not db.execute(
+            "SELECT 1 FROM pantry_item WHERE normalized = ?", (norm,)
+        ).fetchone():
+            db.execute(
+                "INSERT INTO pantry_item (name, normalized, category) "
+                "VALUES (?, ?, ?)",
+                (name, norm, guess_category(name)),
+            )
+            db.execute(
+                "INSERT INTO purchase_history (name, unit) VALUES (?, ?)",
+                (name.strip().title(), ""),
+            )
+        if key:
+            db.execute("INSERT OR IGNORE INTO excluded_item (key) VALUES (?)", (key,))
+        db.commit()
+        _list_changed()
+        return jsonify({"ok": True})
+
+    @app.route("/list/pantry-toggle", methods=["POST"])
+    def list_pantry_toggle():
+        """The row checkbox = "I have this". Checking saves the item to the
+        pantry as a staple (so it drops into "Already have on hand" now and
+        auto-matches future recipes) and records a purchase signal for the
+        Quick Add predictor; unchecking removes that exact staple again."""
+        if request.is_json:
+            name = (request.json.get("name") or "").strip()
+            checked = request.json.get("checked")
+        else:
+            name = request.form.get("name", "").strip()
+            checked = request.form.get("checked")
+        if not name:
+            return jsonify({"ok": False, "error": "missing name"}), 400
+        norm = normalize_name(name)
+        db = get_db()
+        if checked in (True, "true", "1", "on"):
+            exists = db.execute(
+                "SELECT 1 FROM pantry_item WHERE normalized = ?", (norm,)
+            ).fetchone()
+            if not exists:
+                db.execute(
+                    "INSERT INTO pantry_item (name, normalized, category) "
+                    "VALUES (?, ?, ?)",
+                    (name, norm, guess_category(name)),
+                )
+                # A fresh staple doubles as a "we have/keep this" purchase
+                # signal; title-cased to match how names are stored elsewhere.
+                db.execute(
+                    "INSERT INTO purchase_history (name, unit) VALUES (?, ?)",
+                    (name.strip().title(), ""),
+                )
+        else:
+            db.execute("DELETE FROM pantry_item WHERE normalized = ?", (norm,))
+        db.commit()
+        _list_changed()
+        return jsonify({"ok": True})
+
     @app.route("/list/toggle", methods=["POST"])
     def list_toggle():
         key = request.json.get("key") if request.is_json else request.form.get("key")
@@ -2708,6 +2940,9 @@ def create_app() -> Flask:
         if scope in ("all", "recipes"):
             db.execute("DELETE FROM list_recipe")
             db.execute("DELETE FROM checked_item WHERE key LIKE 'recipe::%'")
+            # Per-item "×" removals only make sense against the current
+            # recipe set — wipe them so a fresh list starts clean.
+            db.execute("DELETE FROM excluded_item")
         if scope in ("all", "adhoc"):
             db.execute("DELETE FROM adhoc_item")
             db.execute("DELETE FROM checked_item WHERE key LIKE 'adhoc::%'")

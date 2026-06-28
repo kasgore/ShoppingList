@@ -15,8 +15,12 @@ CATEGORIES = [
     "Produce",
     "Meat & Seafood",
     "Dairy & Eggs",
-    "Bakery",
-    "Pantry",
+    "Bread/Wraps",
+    "Spices & Seasonings",
+    "Canned & Jarred",
+    "Dried Goods & Grains",
+    "Baking",
+    "Oils & Condiments",
     "Frozen",
     "Beverages",
     "Snacks",
@@ -281,6 +285,46 @@ def normalize_name(name: str) -> str:
     n = re.sub(r"\s+", " ", n).strip()
     n = " ".join(_singularize_word(w) for w in n.split())
     return _NAME_SYNONYMS.get(n, n)
+
+
+# Words that don't identify *what* a food is — packaging/form/prep, sizes,
+# colors, units, and connectives — so two names sharing only these don't
+# count as a pantry match. Everything left after this filter is a "real"
+# food word ("rice", "noodle", "vinegar", "tofu", ...).
+_MATCH_STOPWORDS = frozenset({
+    # connectives
+    "of", "and", "or", "the", "a", "an", "to", "for", "with", "in", "into",
+    "plus", "your", "my", "no", "non",
+    # packaging / form / prep / state
+    "canned", "jarred", "dried", "frozen", "fresh", "whole", "ground",
+    "raw", "light", "dark", "mix", "style", "powdered", "instant", "quick",
+    "roasted", "smoked", "toasted", "cooked", "shredded", "sweetened",
+    "unsweetened", "reduced", "low", "fat", "free",
+    # sizes
+    "medium", "large", "small", "extra", "mini", "thin", "thick", "regular",
+    # colors
+    "red", "green", "white", "black", "brown", "yellow", "golden", "purple",
+    "orange",
+    # units / measures
+    "oz", "ounce", "lb", "pound", "cup", "tbsp", "tsp", "tablespoon",
+    "teaspoon", "gram", "g", "kg", "ml", "l", "liter", "litre", "can", "jar",
+    "bottle", "bag", "pkg", "package", "box", "bunch", "head", "clove",
+    "slice", "piece", "pinch", "dash", "count", "ct",
+})
+
+
+def significant_tokens(name: str) -> set[str]:
+    """The set of meaningful food words in a name, used for fuzzy pantry
+    matching. Normalizes (lowercase, de-qualify, singularize), splits into
+    word tokens, then drops stopwords and 1-letter tokens. So "Rice
+    Noodles- Medium" and "rice noodles" both reduce to {rice, noodle}, and
+    "Vinegar- Apple Cider" matches "apple cider vinegar"."""
+    # Re-singularize per token: normalize_name singularizes on whitespace
+    # splits, so a token glued to punctuation ("noodles-") slips through.
+    toks = (_singularize_word(t) for t in re.findall(r"[a-z0-9]+", normalize_name(name)))
+    # Drop 1-letter tokens, pure numbers (embedded quantities like "60" in
+    # "60 ml water"), and stopwords — none identify a food.
+    return {t for t in toks if len(t) > 1 and not t.isdigit() and t not in _MATCH_STOPWORDS}
 
 
 def format_quantity(qty: float) -> str:
@@ -565,19 +609,19 @@ _CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "arugula", "rocket", "lettuce", "romaine", "iceberg", "spinach",
         "kale", "chard", "collard", "endive", "watercress", "frisee",
         "radicchio", "mesclun", "microgreen", "sprouts",
-        # Herbs (fresh)
-        "basil", "parsley", "cilantro", "mint", "dill", "thyme",
-        "rosemary", "sage", "oregano", "tarragon", "chive", "scallion",
+        # Fresh herbs (the dried-by-default ones — oregano, thyme,
+        # rosemary, sage, parsley — live under Spices & Seasonings).
+        "basil", "cilantro", "mint", "dill", "chive", "scallion",
         "green onion", "leek", "shallot",
         # Cruciferous & alliums
         "broccoli", "cauliflower", "cabbage", "brussels", "bok choy",
         "onion", "garlic", "fennel",
         # Roots & tubers
         "potato", "sweet potato", "yam", "carrot", "beet", "turnip",
-        "parsnip", "radish", "ginger", "turmeric", "rutabaga",
+        "parsnip", "radish", "ginger", "rutabaga",
         "jicama", "kohlrabi",
         # Squash family
-        "zucchini", "squash", "pumpkin", "cucumber", "eggplant",
+        "zucchini", "squash", "cucumber", "eggplant",
         # Peppers (fresh)
         "bell pepper", "jalapeno", "jalapeño", "serrano", "habanero",
         "poblano", "chili pepper", "chile pepper", "anaheim",
@@ -585,15 +629,15 @@ _CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "tomato", "cherry tomato", "grape tomato",
         # Other vegetables
         "celery", "asparagus", "artichoke", "okra", "snap pea",
-        "snow pea", "green bean", "pea pod", "corn on the cob",
+        "snow pea", "pea pod", "corn on the cob",
         "mushroom", "shiitake", "portobello", "cremini",
         # Fruit
         "apple", "banana", "orange", "lemon", "lime", "grapefruit",
         "berry", "strawberry", "blueberry", "raspberry", "blackberry",
         "grape", "melon", "watermelon", "cantaloupe", "honeydew",
         "peach", "plum", "pear", "pineapple", "mango", "kiwi",
-        "papaya", "avocado", "cherry", "apricot", "fig", "date",
-        "pomegranate", "coconut", "fresh herb",
+        "papaya", "avocado", "cherry", "apricot", "fig",
+        "pomegranate", "fresh herb",
     ]),
     ("Meat & Seafood", [
         "beef", "steak", "ribeye", "sirloin", "brisket", "filet",
@@ -617,14 +661,14 @@ _CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "yogurt", "greek yogurt", "kefir",
         "egg", "eggs",
     ]),
-    ("Bakery", [
+    ("Bread/Wraps", [
         "bread", "loaf", "baguette", "ciabatta", "sourdough", "bun",
-        "buns", "tortilla", "pita", "naan", "bagel", "roll", "rolls",
-        "english muffin", "croissant", "biscuits",
+        "tortilla", "wrap", "flatbread", "pita", "naan", "bagel",
+        "roll", "english muffin", "croissant", "biscuit",
     ]),
     ("Frozen", [
         "frozen", "ice cream", "popsicle", "frozen pizza",
-        "frozen vegetables", "frozen fruit",
+        "frozen vegetable", "frozen fruit",
     ]),
     ("Beverages", [
         "coke", "diet coke", "pepsi", "soda", "sparkling water",
@@ -635,88 +679,155 @@ _CATEGORY_RULES: list[tuple[str, list[str]]] = [
         "energy drink", "gatorade", "powerade",
     ]),
     ("Snacks", [
-        "chip", "chips", "cracker", "crackers", "cookie", "cookies",
-        "pretzel", "popcorn", "granola bar", "trail mix",
-        "candy", "chocolate bar", "gum",
+        "chip", "tortilla chip", "cracker", "cookie",
+        "pretzel", "popcorn", "granola", "granola bar", "trail mix",
+        "sunflower seed", "candy", "chocolate bar", "gum",
     ]),
-    ("Pantry", [
-        # Baking
-        "flour", "all-purpose", "bread flour", "cake flour",
-        "sugar", "brown sugar", "powdered sugar", "confectioners",
-        "baking powder", "baking soda", "yeast", "cocoa",
-        "chocolate chip", "vanilla", "vanilla extract", "almond extract",
-        # Seasonings (dry)
-        "salt", "kosher salt", "sea salt", "black pepper",
-        "white pepper", "peppercorn", "cinnamon", "nutmeg",
-        "paprika", "cumin", "coriander", "cardamom", "clove",
-        "bay leaf", "red pepper flake", "chili powder",
-        "garlic powder", "onion powder", "italian seasoning",
-        "taco seasoning", "fajita seasoning", "old bay",
-        "everything bagel seasoning", "spice", "seasoning",
-        # Oils & vinegars
-        "olive oil", "vegetable oil", "canola oil", "sesame oil",
-        "avocado oil", "coconut oil", "oil",
-        "vinegar", "balsamic", "rice vinegar", "apple cider vinegar",
-        # Sauces & condiments
-        "ketchup", "mustard", "mayo", "mayonnaise", "soy sauce",
-        "worcestershire", "hot sauce", "sriracha", "bbq sauce",
-        "barbecue sauce", "salsa", "tomato sauce", "tomato paste",
-        "marinara", "pasta sauce", "pesto", "alfredo sauce",
-        "fish sauce", "oyster sauce", "hoisin", "teriyaki",
-        "salad dressing", "ranch dressing", "italian dressing",
-        "honey", "maple syrup", "syrup", "jam", "jelly",
-        "peanut butter", "almond butter", "nutella",
-        # Grains & legumes
+    ("Spices & Seasonings", [
+        # Salts & peppers
+        "salt", "kosher salt", "sea salt", "black salt", "garlic salt",
+        "seasoning salt", "black pepper", "white pepper", "peppercorn",
+        "cayenne", "red pepper flake", "red pepper powder", "pepper powder",
+        "red chili", "chili powder", "chili flake", "paprika", "smoked paprika",
+        "ancho", "kashmiri", "sichuan", "korean red pepper",
+        # Whole & ground spices
+        "cinnamon", "nutmeg", "cumin", "coriander", "cardamom", "clove",
+        "allspice", "all spice", "mace", "star anise", "fenugreek",
+        "fennel seed", "caraway", "celery seed", "coriander seed",
+        "cumin seed", "mustard seed", "poppy seed", "sesame seed",
+        "methi", "kasuri methi", "turmeric", "ground ginger", "ginger- ground",
+        # Dried herbs
+        "oregano", "thyme", "rosemary", "sage", "parsley", "tarragon",
+        "marjoram", "bay leaf", "bay leaves",
+        # Blends & rubs
+        "italian seasoning", "taco seasoning", "fajita seasoning",
+        "old bay", "everything bagel seasoning", "garam masala",
+        "chat masala", "curry powder", "five spice", "pumpkin spice",
+        "cajun", "creole", "jerk seasoning", "za'atar", "zaatar",
+        "tajin", "shawarma", "marinade", "rub", "chicken rub", "pork rub",
+        "poultry seasoning", "browning", "chinese five spice",
+        # Aromatics & misc
+        "garlic powder", "onion powder", "minced onion", "onion soup mix",
+        "mushroom powder", "nutritional yeast", "alum",
+        "cream of tartar", "cream of tarter", "no-salt seasoning",
+        "spice", "seasoning",
+    ]),
+    ("Canned & Jarred", [
+        "canned", "can of", "broth", "stock", "bouillon",
+        # Canned tomatoes
+        "crushed tomato", "diced tomato", "tomato puree", "tomato paste",
+        "tomato sauce", "fire roasted", "sun dried tomato",
+        "sundried tomato",
+        # Jarred cooking sauces & pastes
+        "pizza sauce", "pasta sauce", "marinara", "alfredo",
+        "curry paste", "green curry", "butter chicken", "channa masala",
+        "tikka masala", "pesto", "basil pesto", "chutney",
+        # Canned veg, beans & fruit (the explicitly-canned ones; "canned"
+        # above is also force-matched, see guess_category)
+        "baked bean", "refried bean", "green bean", "butter bean",
+        "lima bean", "roasted red pepper", "hearts of palm",
+        "heart of palm", "artichoke heart", "jackfruit", "candied jalapeno",
+        "coconut milk", "evaporated milk", "condensed milk",
+        "olive", "caper", "pickle", "spam",
+    ]),
+    ("Dried Goods & Grains", [
+        # Pasta & noodles
         "pasta", "spaghetti", "penne", "rigatoni", "fettuccine",
         "linguine", "lasagna noodle", "noodle", "ramen", "udon",
-        "rice", "basmati", "jasmine", "wild rice", "quinoa",
-        "couscous", "barley", "oats", "oatmeal",
+        "angel hair", "rotini", "macaroni", "mac & cheese", "rice noodle",
+        "rice paper",
+        # Rice & grains
+        "rice", "basmati", "jasmine", "arborio", "wild rice", "quinoa",
+        "couscous", "barley", "oats", "oatmeal", "farro", "buckwheat",
+        "groats", "millet", "bulgur", "potato flake",
+        # Legumes & meat substitutes
         "bean", "lentil", "chickpea", "garbanzo", "kidney bean",
-        "black bean", "pinto bean",
-        # Canned & jarred
-        "canned", "can of", "broth", "stock", "bouillon",
-        "crushed tomatoes", "diced tomatoes", "tomato puree",
-        "coconut milk", "evaporated milk", "condensed milk",
-        "olives", "capers", "pickles",
+        "black bean", "pinto bean", "split pea", "dal", "moong",
+        "tofu", "tvp", "soy curl", "seitan",
         # Nuts & seeds
         "almond", "walnut", "pecan", "cashew", "pistachio", "peanut",
-        "pine nut", "sunflower seed", "pumpkin seed", "chia",
-        "flaxseed", "sesame seed",
-        # Misc dry
-        "cereal", "granola", "breadcrumb", "croutons", "stuffing",
+        "pine nut", "pumpkin seed", "chia", "flaxseed", "nori",
+        # Cereal & other dry goods
+        "cereal", "crouton", "stuffing",
+    ]),
+    ("Baking", [
+        # Flours & starches
+        "flour", "all-purpose", "bread flour", "cake flour",
+        "almond flour", "cassava", "masa", "tapioca", "arrowroot",
+        "cornstarch", "corn starch", "cornmeal", "corn meal",
+        "potato starch", "vital wheat gluten", "wheat gluten",
+        # Sugars & sweeteners
+        "sugar", "brown sugar", "powdered sugar", "confectioners",
+        "molasses", "corn syrup",
+        # Leaveners & flavorings
+        "baking powder", "baking soda", "yeast", "cocoa", "cacao",
+        "chocolate chip", "vanilla", "vanilla extract", "almond extract",
+        # Bits & add-ins
+        "shortening", "pancake mix", "raisin", "date", "coconut",
+        "shredded coconut", "breadcrumb", "bread crumb", "pea protein",
+    ]),
+    ("Oils & Condiments", [
+        # Oils & vinegars
+        "olive oil", "vegetable oil", "canola oil", "sesame oil",
+        "avocado oil", "coconut oil", "peanut oil", "oil",
+        "vinegar", "balsamic", "rice vinegar", "apple cider vinegar",
+        "red wine vinegar", "white vinegar", "vinaigrette", "vinegarette",
+        # Sauces & condiments
+        "ketchup", "mustard", "mayo", "mayonnaise", "aioli", "soy sauce",
+        "worcestershire", "hot sauce", "sriracha", "sambal",
+        "chili crisp", "chili paste", "bbq sauce", "barbecue sauce",
+        "salsa", "fish sauce", "oyster sauce", "hoisin", "teriyaki",
+        "salad dressing", "ranch dressing", "italian dressing",
+        "dressing", "tahini", "liquid smoke",
+        "honey", "maple syrup", "syrup", "jam", "jelly",
+        "peanut butter", "almond butter", "nutella",
     ]),
     ("Household", [
-        "paper towel", "toilet paper", "tissue", "napkin", "foil",
-        "plastic wrap", "parchment", "ziploc", "trash bag",
-        "dish soap", "laundry detergent", "bleach", "sponge",
-        "toothpaste", "toothbrush", "shampoo", "conditioner",
-        "soap", "deodorant",
+        "paper towel", "toilet paper", "tissue", "kleenex", "napkin",
+        "paper plate", "foil", "plastic wrap", "parchment", "ziploc",
+        "trash bag", "garbage bag", "dish soap", "laundry detergent",
+        "bleach", "sponge", "toothpaste", "toothbrush", "shampoo",
+        "conditioner", "soap", "deodorant",
     ]),
 ]
 
 # Precompiled longest-keyword-first patterns so multi-word phrases win
-# over single-word substrings: "baking soda" (Pantry) beats "soda"
+# over single-word substrings: "baking soda" (Baking) beats "soda"
 # (Beverages); "ice cream" (Frozen) beats "cream" (Dairy & Eggs);
 # "almond milk" (Beverages) beats "milk" (Dairy & Eggs). Tie-breaking on
 # equal-length keywords falls to source order via the stable sort.
+#
+# A trailing "(?:es|s)?" makes every keyword plural-aware so "bean" matches
+# "beans", "lentil" matches "lentils", and "potato"/"tomato" match
+# "potatoes"/"tomatoes" — the bulk of how staples are actually written. The
+# ranking length is the *base* keyword, so "kidney bean" still beats "bean".
 _CLASSIFIER_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE), cat)
+    (re.compile(r"\b" + re.escape(kw) + r"(?:es|s)?\b", re.IGNORECASE), cat)
     for kw, cat in sorted(
         ((kw, cat) for cat, kws in _CATEGORY_RULES for kw in kws),
         key=lambda x: -len(x[0]),
     )
 ]
 
+# "Canned" is a deliberate, unambiguous signal — people write "Black Beans-
+# Canned", "Tuna- Canned", etc. — so it wins outright over any aisle a
+# keyword like "tuna" (Meat) or "black bean" (Dried Goods) would otherwise
+# claim. Checked before the keyword scan in guess_category.
+_CANNED_RE = re.compile(r"\bcanned\b|\bcan of\b", re.IGNORECASE)
+
 
 def guess_category(name: str) -> str:
     """Lightweight keyword classifier so imported items don't all default
     to 'Other'. Users can correct anything wrong on the edit page.
 
-    Longest keyword wins, so "baking soda" → Pantry (not Beverages via
+    Longest keyword wins, so "baking soda" → Baking (not Beverages via
     "soda"), "ice cream" → Frozen (not Dairy & Eggs via "cream"), and
-    "almond milk" → Beverages (not Dairy & Eggs via "milk")."""
+    "almond milk" → Beverages (not Dairy & Eggs via "milk"). An explicit
+    "canned" anywhere in the name short-circuits to Canned & Jarred."""
     if not name:
         return "Other"
+    if _CANNED_RE.search(name):
+        return "Canned & Jarred"
     for pattern, category in _CLASSIFIER_PATTERNS:
         if pattern.search(name):
             return category

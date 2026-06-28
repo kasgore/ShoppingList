@@ -295,7 +295,25 @@ form.inline { display: inline; }
   height: 1px;
   background: var(--line-soft);
   margin-left: 4px;
+  order: 1;            /* keep the divider before the far-right chevron */
 }
+
+/* Collapsible aisle sections: the header is a toggle, with a chevron that
+   points down when open and right when collapsed. Wired up in app.js. */
+.list-card h3.cat[role="button"] { cursor: pointer; user-select: none; }
+.cat-chevron {
+  width: 0;
+  height: 0;
+  flex: 0 0 auto;
+  order: 2;            /* sit at the far right, after the divider line */
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid currentColor;
+  opacity: .65;
+  transition: transform .15s ease;
+}
+.cat-section.collapsed .cat-chevron { transform: rotate(-90deg); }
+.cat-section.collapsed .items { display: none; }
 .items { list-style: none; padding: 0; margin: 0; }
 .item {
   display: flex;
@@ -384,9 +402,29 @@ form.inline { display: inline; }
   --cat-color: #8a6a3a;
   --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><ellipse fill='black' cx='12' cy='13.5' rx='6.5' ry='8.5'/></svg>");
 }
-.cat-section[data-cat="Bakery"] {
+.cat-section[data-cat="Bread/Wraps"] {
   --cat-color: #a26a32;
   --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M12 22V4'/><path d='M12 14c-2.5 0-4-1.5-4-4 2 0 3.5 1 4 4z' fill='black'/><path d='M12 14c2.5 0 4-1.5 4-4-2 0-3.5 1-4 4z' fill='black'/><path d='M12 10c-2.5 0-4-1.5-4-4 2 0 3.5 1 4 4z' fill='black'/><path d='M12 10c2.5 0 4-1.5 4-4-2 0-3.5 1-4 4z' fill='black'/></svg>");
+}
+.cat-section[data-cat="Spices & Seasonings"] {
+  --cat-color: #c2683a;
+  --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='black' d='M9 2h6v3H9zM7 6h10l-1 14a2 2 0 01-2 2h-4a2 2 0 01-2-2L7 6zm1.5 3v2h2V9h-2zm4 0v2h2V9h-2z'/></svg>");
+}
+.cat-section[data-cat="Canned & Jarred"] {
+  --cat-color: #4f7a78;
+  --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><ellipse fill='black' cx='12' cy='5' rx='7' ry='2.5'/><path fill='black' d='M5 5v14c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V5c0 1.4-3.1 2.5-7 2.5S5 6.4 5 5z'/></svg>");
+}
+.cat-section[data-cat="Dried Goods & Grains"] {
+  --cat-color: #9c8746;
+  --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><path d='M12 22V8'/><path d='M12 8c-2-1-3-3-3-5 2 0 3 1 3 3M12 8c2-1 3-3 3-5-2 0-3 1-3 3M12 13c-2-1-3-3-3-5 2 0 3 1 3 3M12 13c2-1 3-3 3-5-2 0-3 1-3 3'/></svg>");
+}
+.cat-section[data-cat="Baking"] {
+  --cat-color: #a8729a;
+  --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='black' d='M3 10h18a9 9 0 01-9 9 9 9 0 01-9-9zm9-7c1.6 0 2 1 2 2s-.4 1.6-2 2-2-1-2-2 .4-2 2-2z'/></svg>");
+}
+.cat-section[data-cat="Oils & Condiments"] {
+  --cat-color: #7d8a3e;
+  --cat-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='black' d='M10 2h4v3l1 2v13a2 2 0 01-2 2h-2a2 2 0 01-2-2V7l1-2V2z'/></svg>");
 }
 .cat-section[data-cat="Pantry"] {
   --cat-color: #7e5a92;
@@ -1155,30 +1193,72 @@ code {
 .list-progress::-moz-progress-bar { background: var(--accent); }
 .list-progress[value="0"] { opacity: .45; }
 
-#hide-checked-toggle[aria-pressed="true"],
-#hide-pantry-toggle[aria-pressed="true"] {
+#hide-checked-toggle[aria-pressed="true"] {
   background: var(--accent);
   color: var(--accent-ink);
   border-color: var(--accent);
 }
 
-/* "Probably have it" recipe staples — dimmed, with a little house tag. */
-.item.pantry .name { color: var(--muted); }
-.pantry-tag {
-  font-size: .85em;
-  opacity: .75;
+/* Pantry page: aisle sections reuse the shopping-list .cat-section /
+   h3.cat styling via .pantry-sections.list-card. Each row is a name plus
+   a small "re-file" dropdown and a remove button. */
+.pantry-items .item { gap: 8px; }
+.pantry-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex: 0 0 auto;
-  align-self: center;
-  cursor: help;
 }
+.pantry-cat-select {
+  font-size: .8rem;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card, #fff);
+  color: var(--muted);
+  max-width: 11rem;
+}
+.pantry-cat-select:hover { color: inherit; }
 
-/* Hide checked / pantry items, and a category section once everything in
-   it would be hidden. (:has() — Safari 15.4+, Chrome 105+.) */
-#list.hide-checked .item.checked { display: none; }
-#list.hide-pantry .item.pantry { display: none; }
-#list.hide-checked:not(.hide-pantry) .cat-section:not(:has(.item:not(.checked))) { display: none; }
-#list.hide-pantry:not(.hide-checked) .cat-section:not(:has(.item:not(.pantry))) { display: none; }
-#list.hide-checked.hide-pantry .cat-section:not(:has(.item:not(.checked):not(.pantry))) { display: none; }
+/* "Already have on hand" — pantry staples pulled out of the buy-list into
+   their own muted card so you can see at a glance what you don't need. */
+/* Proposed page: coverage badge + "still need" ingredient chips. */
+.coverage {
+  font-size: .85rem;
+  font-weight: 600;
+  margin: 2px 0 6px;
+  color: var(--accent-deep, #5f8a4d);
+}
+.coverage-full { color: #5f8a4d; }
+.missing-chips {
+  list-style: none;
+  padding: 0;
+  margin: 2px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.missing-chips li {
+  font-size: .72rem;
+  line-height: 1;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: var(--line-soft, #eee);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.web-setup ol { margin: 6px 0 0 1.1rem; padding: 0; }
+.web-setup li { margin: 3px 0; }
+.web-card.web-hidden { display: none; }
+.web-more-wrap { text-align: center; margin-top: 14px; }
+
+/* On-hand rows use the same checkbox/label layout as the buy list, just
+   muted to read as "you already have these". */
+.on-hand-card { opacity: .95; }
+.on-hand-card h2 { display: flex; align-items: center; gap: .35rem; }
+.on-hand-icon { font-size: .9em; }
+.on-hand-items .item.on-hand .name,
+.on-hand-items .item.on-hand .qty { color: var(--muted); }
 
 /* --- Flash messages: auto-fade ------------------------------------- */
 /* #flashes is always in the DOM (so AJAX handlers can swap fresh

@@ -52,6 +52,7 @@ pre-restore-*.zip
 .env.local
 .env.*.local
 .secret_key
+.spoonacular_key
 *.pem
 *.key
 
