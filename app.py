@@ -1587,15 +1587,12 @@ def create_app() -> Flask:
     def proposed_page():
         db = get_db()
         from_recipes = propose_from_recipes(db)
-        from_web = propose_from_web(db)   # None when no API key is set
         has_pantry = (
             db.execute("SELECT COUNT(*) FROM pantry_item").fetchone()[0] > 0
         )
         return render_template(
             "proposed.html",
             from_recipes=from_recipes,
-            from_web=from_web,
-            web_enabled=from_web is not None,
             has_pantry=has_pantry,
         )
 
@@ -2370,10 +2367,32 @@ def create_app() -> Flask:
     @app.post("/pantry/<int:item_id>/delete")
     def pantry_delete(item_id: int):
         db = get_db()
+        # Removing a pantry staple means you've run out of it — so drop it
+        # straight onto the shopping list as an ad-hoc item. Skip if an
+        # ad-hoc item with the same name is already on the list.
+        row = db.execute(
+            "SELECT name, category FROM pantry_item WHERE id = ?", (item_id,)
+        ).fetchone()
+        added = False
+        if row:
+            name = row["name"]
+            exists = db.execute(
+                "SELECT 1 FROM adhoc_item WHERE name = ? COLLATE NOCASE", (name,)
+            ).fetchone()
+            if not exists:
+                db.execute(
+                    "INSERT INTO adhoc_item (name, category) VALUES (?, ?)",
+                    (name, row["category"]),
+                )
+                added = True
         db.execute("DELETE FROM pantry_item WHERE id = ?", (item_id,))
         db.commit()
         _list_changed()
-        flash("Removed from pantry.", "success")
+        if added:
+            flash(f"Removed {row['name']} from pantry and added it to the "
+                  "shopping list.", "success")
+        else:
+            flash("Removed from pantry.", "success")
         return redirect(url_for("pantry_page"))
 
     @app.route("/backup")

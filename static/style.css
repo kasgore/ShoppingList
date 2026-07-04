@@ -1,14 +1,14 @@
 :root {
-  /* Botanical kitchen: warm cream, herb green, soft terracotta. Light + airy. */
+  /* Botanical kitchen: warm cream, plum, soft terracotta. Light + airy. */
   --bg: #f4f0e8;
   --card: #fbf8f2;
-  --ink: #2d3e2d;
-  --muted: #6b7866;
+  --ink: #382d38;
+  --muted: #7a6b76;
   --line: #d9d2c1;
   --line-soft: rgba(217, 210, 193, .55);
-  --accent: #6b8c4a;
-  --accent-deep: #4a6932;
-  --accent-soft: #eef2e6;
+  --accent: #8e5574;
+  --accent-deep: #6a3a54;
+  --accent-soft: #f1e7ee;
   --accent-ink: #fbf8f2;
   --terra: #c47a5a;
   --terra-soft: #f6e6dc;
@@ -17,7 +17,7 @@
   --good-bg: #eef2e6;
   --bad-bg: #f7e8e4;
   --radius: 12px;
-  --shadow: 0 2px 14px rgba(45,62,45,.05), 0 1px 3px rgba(45,62,45,.04);
+  --shadow: 0 2px 14px rgba(56,45,56,.05), 0 1px 3px rgba(56,45,56,.04);
 }
 
 * { box-sizing: border-box; }
@@ -656,7 +656,7 @@ code {
   box-shadow: var(--shadow);
   transition: transform .15s ease, box-shadow .15s ease;
 }
-.recipe-card:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(45,62,45,.08), 0 2px 4px rgba(45,62,45,.04); }
+.recipe-card:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(56,45,56,.08), 0 2px 4px rgba(56,45,56,.04); }
 .recipe-card-link {
   color: inherit;
   text-decoration: none;

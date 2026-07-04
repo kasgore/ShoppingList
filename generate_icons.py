@@ -17,9 +17,9 @@ os.makedirs(OUT_DIR, exist_ok=True)
 #   - 1024: future-proof, never hurts
 SIZES = [180, 192, 512, 1024]
 
-# Brand color (matches the app's botanical kitchen herb-green accent).
-BG_TOP = (139, 169, 115)    # #8ba973 — lighter herb green
-BG_BOTTOM = (74, 105, 50)   # #4a6932 — deeper herb green
+# Brand color (matches the app's botanical kitchen plum accent).
+BG_TOP = (176, 130, 160)    # #b082a0 — lighter plum
+BG_BOTTOM = (106, 58, 84)   # #6a3a54 — deeper plum
 
 
 def gradient(w: int, h: int) -> Image.Image:
@@ -130,7 +130,7 @@ def main() -> None:
     # Maskable icon: a 512px version with safe-zone padding so Android can
     # crop it into circles/squircles without cutting off the pot.
     base = draw_icon(512)
-    canvas = Image.new("RGBA", (512, 512), (107, 140, 74, 255))  # #6b8c4a — accent herb green
+    canvas = Image.new("RGBA", (512, 512), (142, 85, 116, 255))  # #8e5574 — accent plum
     inset = int(512 * 0.10)
     shrunk = base.resize((512 - inset * 2, 512 - inset * 2), Image.LANCZOS)
     canvas.paste(shrunk, (inset, inset), shrunk)
